@@ -1,258 +1,585 @@
-import { useEffect, useState } from 'react'
-import { MapContainer, TileLayer, Marker, Popup, ZoomControl } from 'react-leaflet'
-import L from 'leaflet'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import Globe from 'react-globe.gl'
+import * as THREE from 'three'
+import {
+  CircleMarker,
+  MapContainer,
+  Popup,
+  TileLayer,
+  Tooltip,
+  ZoomControl,
+  useMap,
+} from 'react-leaflet'
+import 'leaflet/dist/leaflet.css'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { useTheme } from '../context/ThemeContext'
+import { ThemeToggle } from '../components/ThemeToggle'
 import { useSocket } from '../hooks/useSocket'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 import {
-  AlertTriangle, LogIn, UserPlus, MapPin, Clock, Filter,
-  X, LayoutDashboard
+  AlertTriangle,
+  Clock,
+  Filter,
+  LayoutDashboard,
+  LogIn,
+  MapPin,
+  UserPlus,
+  X,
 } from 'lucide-react'
 
-// Fix Leaflet default icon
-delete (L.Icon.Default.prototype as any)._getIconUrl
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-})
-
-const URGENCY_COLORS: Record<string, string> = {
-  critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e',
-}
-const TYPE_EMOJI: Record<string, string> = {
-  food: '🍱', water: '💧', medical: '🏥', rescue: '🚁', shelter: '⛺'
-}
-
-const createMarkerIcon = (urgency: string, type: string) =>
-  L.divIcon({
-    className: '',
-    html: `
-      <div style="position:relative">
-        <div style="
-          width:36px;height:36px;border-radius:50%;
-          background:${URGENCY_COLORS[urgency] || '#60a5fa'};
-          border:3px solid rgba(255,255,255,0.9);
-          box-shadow:0 0 16px ${URGENCY_COLORS[urgency] || '#60a5fa'}99,0 2px 8px rgba(0,0,0,0.5);
-          display:flex;align-items:center;justify-content:center;
-          font-size:16px;cursor:pointer;
-          transition:transform 0.2s;
-        ">${TYPE_EMOJI[type] || '🆘'}</div>
-        ${urgency === 'critical' ? `<div style="position:absolute;top:-3px;right:-3px;width:10px;height:10px;background:#ef4444;border-radius:50%;border:2px solid #0a0f1e;animation:sos-blink 1s infinite;"></div>` : ''}
-      </div>
-      <style>@keyframes sos-blink{0%,100%{opacity:1}50%{opacity:0}}</style>
-    `,
-    iconSize: [36, 36],
-    iconAnchor: [18, 18],
-    popupAnchor: [0, -20],
-  })
-
 interface RequestData {
-  _id: string; type: string; urgency: string; description: string; status: string
+  _id: string
+  type: string
+  urgency: 'critical' | 'high' | 'medium' | 'low' | string
+  description: string
+  status: string
   location: { coordinates: [number, number]; address: string }
   submittedBy?: { name: string; phone: string }
-  createdAt: string; numberOfPeople?: number
+  createdAt: string
+  numberOfPeople?: number
 }
+
+interface ActorData {
+  _id: string
+  name: string
+  role: 'admin' | 'volunteer' | 'user' | string
+  isAvailable?: boolean
+  location?: { coordinates?: [number, number] }
+}
+
+interface GlobePoint {
+  lat: number
+  lng: number
+  size: number
+  color: string
+  request: RequestData
+}
+
+const URGENCY_COLORS: Record<string, string> = {
+  critical: '#ef4444',
+  high: '#f97316',
+  medium: '#eab308',
+  low: '#22c55e',
+}
+
+const TYPE_LABELS: Record<string, string> = {
+  food: 'Food',
+  water: 'Water',
+  medical: 'Medical',
+  rescue: 'Rescue',
+  shelter: 'Shelter',
+}
+
+const EARTH_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg'
+const BACKGROUND_STARS = 'https://unpkg.com/three-globe/example/img/night-sky.png'
+const INDIA_CENTER: [number, number] = [20.5937, 78.9629]
+const MAP_TILE_LIGHT = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+const MAP_TILE_DARK = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
 
 const timeAgo = (date: string) => {
   const diff = Math.floor((Date.now() - new Date(date).getTime()) / 60000)
   if (diff < 1) return 'Just now'
   if (diff < 60) return `${diff}m ago`
-  return `${Math.floor(diff / 60)}h ago`
+  if (diff < 1440) return `${Math.floor(diff / 60)}h ago`
+  return `${Math.floor(diff / 1440)}d ago`
 }
 
-// India center
-const INDIA_CENTER: [number, number] = [20.5937, 78.9629]
+const getPointSize = (urgency: string) => {
+  if (urgency === 'critical') return 0.55
+  if (urgency === 'high') return 0.42
+  if (urgency === 'medium') return 0.34
+  return 0.28
+}
+
+const getLatLng = (coords?: [number, number]) => {
+  if (!coords || coords.length !== 2) return null
+  const [lng, lat] = coords
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null
+  return [lat, lng] as [number, number]
+}
+
+const FlyToSelection = ({ target }: { target: [number, number] | null }) => {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!target) return
+    map.flyTo(target, Math.max(map.getZoom(), 6), { duration: 0.8 })
+  }, [map, target])
+
+  return null
+}
 
 export default function HomePage() {
   const { user, logout } = useAuth()
+  const { theme } = useTheme()
   const navigate = useNavigate()
   const { socket, connected } = useSocket(user)
+
+  const globeRef = useRef<any>(null)
+  const globeViewportRef = useRef<HTMLDivElement | null>(null)
+
   const [requests, setRequests] = useState<RequestData[]>([])
+  const [actors, setActors] = useState<ActorData[]>([])
   const [filterUrgency, setFilterUrgency] = useState('all')
   const [filterType, setFilterType] = useState('all')
-  const [sidebarOpen, setSidebarOpen] = useState(true)
   const [showFilters, setShowFilters] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [viewMode, setViewMode] = useState<'globe' | 'map'>('globe')
+  const [globeSize, setGlobeSize] = useState({ width: 1200, height: 700 })
+  const [selectedRequest, setSelectedRequest] = useState<RequestData | null>(null)
 
   useEffect(() => {
-    if (user) fetchRequests()
+    if (!globeViewportRef.current) return
+
+    const observer = new ResizeObserver(entries => {
+      const entry = entries[0]
+      if (!entry) return
+      setGlobeSize({ width: entry.contentRect.width, height: entry.contentRect.height })
+    })
+
+    observer.observe(globeViewportRef.current)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!globeRef.current || viewMode !== 'globe') return
+
+    const controls = globeRef.current.controls()
+    controls.autoRotate = true
+    controls.autoRotateSpeed = 0.45
+    controls.enableDamping = true
+    controls.dampingFactor = 0.08
+    controls.minDistance = 130
+    controls.maxDistance = 420
+    globeRef.current.pointOfView({ lat: 22, lng: 78, altitude: 2.2 }, 900)
+
+    const scene = globeRef.current.scene() as THREE.Scene
+    const existingCustomLights = scene.children.filter((child: THREE.Object3D) => child.userData && child.userData.customGlobeLight)
+    existingCustomLights.forEach((light: THREE.Object3D) => scene.remove(light))
+
+    const ambientLight = new THREE.AmbientLight(theme === 'dark' ? 0xffffff : 0xf8fbff, theme === 'dark' ? 0.72 : 0.82)
+    ambientLight.userData.customGlobeLight = true
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, theme === 'dark' ? 0.95 : 1.05)
+    keyLight.position.set(180, 140, 220)
+    keyLight.userData.customGlobeLight = true
+
+    const fillLight = new THREE.DirectionalLight(0x9ec8ff, theme === 'dark' ? 0.48 : 0.4)
+    fillLight.position.set(-150, -100, -180)
+    fillLight.userData.customGlobeLight = true
+
+    scene.add(ambientLight)
+    scene.add(keyLight)
+    scene.add(fillLight)
+  }, [theme, viewMode])
+
+  const fetchRequests = useCallback(async () => {
+    try {
+      const { data } = await axios.get('/api/requests?limit=300')
+      setRequests(data.data || [])
+    } catch {
+      // guest view
+    }
+  }, [])
+
+  const fetchActors = useCallback(async () => {
+    if (!user || user.role !== 'admin') {
+      setActors([])
+      return
+    }
+
+    try {
+      const { data } = await axios.get('/api/users')
+      setActors(data.data || [])
+    } catch {
+      setActors([])
+    }
   }, [user])
 
   useEffect(() => {
-    if (!socket) return
-    socket.on('new_request', (req: RequestData) => {
-      setRequests(prev => [req, ...prev])
-      toast(`🚨 New ${req.type} SOS — ${req.urgency}`, { duration: 5000 })
-    })
-    socket.on('request_status_updated', ({ requestId, status }: any) => {
-      setRequests(prev => prev.map(r => r._id === requestId ? { ...r, status } : r))
-    })
-    socket.on('sos_assigned', ({ message }: any) => { toast.success(message, { duration: 7000 }) })
-    socket.on('sos_resolved', ({ message }: any) => { toast.success(message, { icon: '✅', duration: 8000 }) })
-    return () => {
-      socket.off('new_request')
-      socket.off('request_status_updated')
-      socket.off('sos_assigned')
-      socket.off('sos_resolved')
+    if (user) {
+      fetchRequests()
+      fetchActors()
     }
-  }, [socket])
+  }, [user, fetchRequests, fetchActors])
 
-  const fetchRequests = async () => {
-    try {
-      const { data } = await axios.get('/api/requests?limit=200')
-      setRequests(data.data || [])
-    } catch { /* guest view — no requests shown */ }
-  }
+  useEffect(() => {
+    if (!socket) return
+
+    const handleNewRequest = (req: RequestData) => {
+      setRequests(prev => [req, ...prev])
+      toast(`New ${req.type} SOS - ${req.urgency}`, { duration: 4500 })
+    }
+
+    const handleStatusUpdate = ({ requestId, status }: { requestId: string; status: string }) => {
+      setRequests(prev => prev.map(r => (r._id === requestId ? { ...r, status } : r)))
+      setSelectedRequest(prev => (prev && prev._id === requestId ? { ...prev, status } : prev))
+    }
+
+    const handleVolunteerUpdate = () => {
+      fetchActors()
+    }
+
+    const handleVolunteerLocationUpdated = (payload: {
+      volunteerId: string
+      location?: { lat: number; lng: number }
+      status?: string
+      incidentId?: string | null
+    }) => {
+      if (!payload?.volunteerId || !payload.location) return
+      const location = payload.location
+      setActors(prev =>
+        prev.map(actor =>
+          actor._id === payload.volunteerId
+            ? {
+                ...actor,
+                isAvailable: payload.status === 'available',
+                location: {
+                  ...(actor.location || {}),
+                  coordinates: [location.lng, location.lat] as [number, number],
+                },
+              }
+            : actor
+        )
+      )
+    }
+
+    const handleUserLocationUpdated = (payload: {
+      userId: string
+      location?: { lat: number; lng: number }
+    }) => {
+      if (!payload?.userId || !payload.location) return
+      const location = payload.location
+      setActors(prev =>
+        prev.map(actor =>
+          actor._id === payload.userId
+            ? {
+                ...actor,
+                location: {
+                  ...(actor.location || {}),
+                  coordinates: [location.lng, location.lat] as [number, number],
+                },
+              }
+            : actor
+        )
+      )
+    }
+
+    socket.on('new_request', handleNewRequest)
+    socket.on('request_status_updated', handleStatusUpdate)
+    socket.on('volunteer_status_update', handleVolunteerUpdate)
+    socket.on('volunteer_location_updated', handleVolunteerLocationUpdated)
+    socket.on('user_location_updated', handleUserLocationUpdated)
+    socket.on('volunteer_assignment_updated', handleVolunteerUpdate)
+    socket.on('incident_assignment_updated', handleVolunteerUpdate)
+
+    return () => {
+      socket.off('new_request', handleNewRequest)
+      socket.off('request_status_updated', handleStatusUpdate)
+      socket.off('volunteer_status_update', handleVolunteerUpdate)
+      socket.off('volunteer_location_updated', handleVolunteerLocationUpdated)
+      socket.off('user_location_updated', handleUserLocationUpdated)
+      socket.off('volunteer_assignment_updated', handleVolunteerUpdate)
+      socket.off('incident_assignment_updated', handleVolunteerUpdate)
+    }
+  }, [socket, fetchActors])
 
   const getDashboardLink = () => {
     if (!user) return '/login'
     if (user.role === 'admin') return '/admin'
     if (user.role === 'volunteer') return '/volunteer'
-    return '/my-requests'  // user dashboard
+    return '/my-requests'
   }
 
-  const filteredRequests = requests.filter(r => {
-    if (filterUrgency !== 'all' && r.urgency !== filterUrgency) return false
-    if (filterType !== 'all' && r.type !== filterType) return false
-    return true
-  })
+  const filteredRequests = useMemo(
+    () =>
+      requests.filter(r => {
+        if (filterUrgency !== 'all' && r.urgency !== filterUrgency) return false
+        if (filterType !== 'all' && r.type !== filterType) return false
+        return true
+      }),
+    [requests, filterUrgency, filterType]
+  )
 
+  const globePoints = useMemo<GlobePoint[]>(
+    () =>
+      filteredRequests
+        .map(r => {
+          const latLng = getLatLng(r.location?.coordinates)
+          if (!latLng) return null
+          return {
+            lat: latLng[0],
+            lng: latLng[1],
+            size: getPointSize(r.urgency),
+            color: URGENCY_COLORS[r.urgency] || '#60a5fa',
+            request: r,
+          }
+        })
+        .filter(Boolean) as GlobePoint[],
+    [filteredRequests]
+  )
+
+  const volunteerMarkers = useMemo(
+    () =>
+      actors
+        .filter(actor => actor.role === 'volunteer')
+        .map(actor => ({ actor, latLng: getLatLng(actor.location?.coordinates) }))
+        .filter(item => item.latLng) as { actor: ActorData; latLng: [number, number] }[],
+    [actors]
+  )
+
+  const userMarkers = useMemo(
+    () =>
+      actors
+        .filter(actor => actor.role === 'user')
+        .map(actor => ({ actor, latLng: getLatLng(actor.location?.coordinates) }))
+        .filter(item => item.latLng) as { actor: ActorData; latLng: [number, number] }[],
+    [actors]
+  )
+
+  const selectedLatLng = selectedRequest ? getLatLng(selectedRequest.location?.coordinates) : null
   const criticalCount = requests.filter(r => r.urgency === 'critical' && r.status === 'pending').length
+
+  const panelBg = theme === 'dark' ? 'rgba(10,15,30,0.82)' : 'rgba(255,255,255,0.84)'
+  const panelBorder = theme === 'dark' ? '1px solid rgba(255,255,255,0.12)' : '1px solid rgba(15,23,42,0.2)'
+  const panelText = theme === 'dark' ? '#f3f4f6' : '#111827'
+  const panelMuted = theme === 'dark' ? '#9ca3af' : '#334155'
+  const activeToggleBg = theme === 'dark' ? '#1d4ed8' : '#2563eb'
+  const activeToggleText = '#ffffff'
+  const inactiveToggleBg = theme === 'dark' ? 'rgba(148,163,184,0.14)' : 'rgba(15,23,42,0.08)'
+  const inactiveToggleText = theme === 'dark' ? '#dbeafe' : '#1e293b'
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--color-bg)' }}>
-      {/* ── Header ── */}
-      <header style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '10px 20px', background: 'rgba(10,15,30,0.96)',
-        borderBottom: '1px solid var(--glass-border)', backdropFilter: 'blur(20px)',
-        zIndex: 1001, flexShrink: 0, gap: 12
-      }}>
+      <header
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '10px 20px',
+          background: theme === 'dark' ? 'rgba(10,15,30,0.96)' : 'rgba(255,255,255,0.92)',
+          borderBottom: '1px solid var(--glass-border)',
+          backdropFilter: 'blur(20px)',
+          zIndex: 1001,
+          gap: 12,
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ background: 'linear-gradient(135deg,#ef4444,#b91c1c)', borderRadius: 10, padding: '7px 8px', display: 'flex' }}>
             <AlertTriangle size={18} color="white" />
           </div>
           <div>
-            <span style={{ fontWeight: 900, fontSize: 18, letterSpacing: '-0.5px' }}>DisasterLink</span>
-            <span style={{ color: 'var(--color-text-muted)', fontSize: 11, display: 'block', lineHeight: 1, marginTop: 1 }}>Relief Coordination Platform</span>
+            <span style={{ fontWeight: 900, fontSize: 18, letterSpacing: '-0.5px', color: panelText }}>DisasterLink</span>
+            <span style={{ color: panelMuted, fontSize: 11, display: 'block', lineHeight: 1, marginTop: 1 }}>Global Relief Command</span>
           </div>
           {criticalCount > 0 && (
             <div style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 20, padding: '3px 10px', display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ef4444', display: 'block', animation: 'sos-blink 1s infinite' }}></span>
-              <style>{`@keyframes sos-blink{0%,100%{opacity:1}50%{opacity:0.3}}`}</style>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ef4444', display: 'block' }}></span>
               <span style={{ fontSize: 12, color: '#f87171', fontWeight: 700 }}>{criticalCount} Critical</span>
             </div>
           )}
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {user && (
+          <ThemeToggle compact />
+          {user ? (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 10px', background: 'var(--glass-bg)', borderRadius: 20, border: '1px solid var(--glass-border)' }}>
                 <span className="conn-dot" style={{ background: connected ? '#22c55e' : '#ef4444', boxShadow: connected ? '0 0 6px #22c55e' : 'none' }}></span>
-                <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{connected ? 'Live' : 'Offline'}</span>
+                <span style={{ fontSize: 12, color: panelMuted }}>{connected ? 'Live' : 'Offline'}</span>
               </div>
-              <span style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>Hi, <strong style={{ color: 'var(--color-text)' }}>{user.name.split(' ')[0]}</strong></span>
+              <span style={{ fontSize: 13, color: panelMuted }}>
+                Hi, <strong style={{ color: panelText }}>{user.name.split(' ')[0]}</strong>
+              </span>
               <Link to={getDashboardLink()} className="btn-primary" style={{ textDecoration: 'none', padding: '7px 14px', fontSize: 13, display: 'flex', alignItems: 'center', gap: 5 }}>
                 <LayoutDashboard size={13} />Dashboard
               </Link>
-              <button onClick={logout} className="btn-secondary" style={{ padding: '7px 12px', fontSize: 13 }}>Logout</button>
+              <button onClick={logout} className="btn-secondary" style={{ padding: '7px 12px', fontSize: 13 }}>
+                Logout
+              </button>
             </>
-          )}
-          {!user && (
+          ) : (
             <>
-              <Link to="/login" className="btn-secondary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', fontSize: 13 }}><LogIn size={13} />Login</Link>
-              <Link to="/register" className="btn-primary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', fontSize: 13 }}><UserPlus size={13} />Register</Link>
+              <Link to="/login" className="btn-secondary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', fontSize: 13 }}>
+                <LogIn size={13} />Login
+              </Link>
+              <Link to="/register" className="btn-primary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5, padding: '7px 12px', fontSize: 13 }}>
+                <UserPlus size={13} />Register
+              </Link>
             </>
           )}
         </div>
       </header>
 
-      {/* ── Body ── */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>
-
-        {/* Map */}
-        <div style={{ flex: 1, position: 'relative' }}>
-          <MapContainer center={INDIA_CENTER} zoom={5} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-            <TileLayer
-              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-              attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'
-            />
-            <ZoomControl position="bottomright" />
-            {filteredRequests.map(req => (
-              <Marker
-                key={req._id}
-                position={[req.location.coordinates[1], req.location.coordinates[0]]}
-                icon={createMarkerIcon(req.urgency, req.type)}
-              >
-                <Popup maxWidth={260}>
-                  <div style={{ minWidth: 220 }}>
-                    <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
-                      <span className={`badge badge-${req.urgency}`}>{req.urgency}</span>
-                      <span className={`badge badge-${req.status}`}>{req.status.replace('_', ' ')}</span>
-                    </div>
-                    <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>
-                      {TYPE_EMOJI[req.type]} {req.type.charAt(0).toUpperCase() + req.type.slice(1)} Request
-                    </div>
-                    {req.description && (
-                      <p style={{ fontSize: 13, color: '#9ca3af', marginBottom: 8, lineHeight: 1.5 }}>{req.description}</p>
-                    )}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      {req.location.address && (
-                        <div style={{ fontSize: 12, color: '#6b7280', display: 'flex', gap: 4, alignItems: 'center' }}>
-                          <MapPin size={11} />{req.location.address}
-                        </div>
-                      )}
-                      {req.numberOfPeople && (
-                        <div style={{ fontSize: 12, color: '#6b7280' }}>👥 {req.numberOfPeople} people affected</div>
-                      )}
-                      <div style={{ fontSize: 12, color: '#6b7280', display: 'flex', gap: 4, alignItems: 'center' }}>
-                        <Clock size={11} />{timeAgo(req.createdAt)}
+        <div style={{ flex: 1, position: 'relative', padding: 14 }}>
+          <div
+            style={{
+              position: 'relative',
+              height: '100%',
+              borderRadius: 18,
+              overflow: 'hidden',
+              border: '1px solid rgba(255,255,255,0.08)',
+              boxShadow: '0 18px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.05)',
+              background: theme === 'dark' ? '#050816' : '#dbeafe',
+            }}
+          >
+            <div ref={globeViewportRef} style={{ width: '100%', height: '100%' }}>
+              {viewMode === 'globe' && globeSize.width > 0 && globeSize.height > 0 && (
+                <Globe
+                  ref={globeRef}
+                  width={globeSize.width}
+                  height={globeSize.height}
+                  globeImageUrl={EARTH_TEXTURE}
+                  backgroundImageUrl={theme === 'dark' ? BACKGROUND_STARS : undefined}
+                  backgroundColor={theme === 'dark' ? '#050816' : '#dbeafe'}
+                  showAtmosphere
+                  atmosphereColor={theme === 'dark' ? '#60a5fa' : '#1d4ed8'}
+                  atmosphereAltitude={0.22}
+                  pointsData={globePoints}
+                  pointLat={(d: object) => (d as GlobePoint).lat}
+                  pointLng={(d: object) => (d as GlobePoint).lng}
+                  pointAltitude={(d: object) => (d as GlobePoint).size}
+                  pointRadius={(d: object) => (d as GlobePoint).size}
+                  pointColor={(d: object) => (d as GlobePoint).color}
+                  pointsMerge={false}
+                  pointLabel={(d: object) => {
+                    const item = (d as GlobePoint).request
+                    const label = TYPE_LABELS[item.type] || item.type
+                    return `
+                      <div style="padding:8px 10px;background:#0f172a;color:#f8fafc;border-radius:8px;border:1px solid rgba(255,255,255,0.2)">
+                        <div style="font-weight:700;text-transform:capitalize;margin-bottom:4px">${label} - ${item.urgency}</div>
+                        <div style="font-size:12px;opacity:.9">${item.location.address || 'Coordinates only'}</div>
+                        <div style="font-size:11px;opacity:.75;margin-top:4px">${item.status.replace('_', ' ')} | ${timeAgo(item.createdAt)}</div>
                       </div>
-                      {req.submittedBy?.name && (
-                        <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid rgba(255,255,255,0.08)', fontSize: 12, color: '#9ca3af' }}>
-                          By: {req.submittedBy.name}
-                          {req.submittedBy.phone && ` · ${req.submittedBy.phone}`}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </Popup>
-              </Marker>
-            ))}
-          </MapContainer>
+                    `
+                  }}
+                  onPointClick={(d: object) => {
+                    const req = (d as GlobePoint).request
+                    setSelectedRequest(req)
+                    globeRef.current?.pointOfView({ lat: (d as GlobePoint).lat, lng: (d as GlobePoint).lng, altitude: 1.8 }, 700)
+                    setViewMode('map')
+                  }}
+                />
+              )}
 
-          {/* Map overlays */}
+              {viewMode === 'map' && (
+                <MapContainer center={selectedLatLng || INDIA_CENTER} zoom={selectedLatLng ? 6 : 4} minZoom={3} maxZoom={18} zoomControl={false} worldCopyJump style={{ width: '100%', height: '100%' }}>
+                  <TileLayer
+                    key={`tiles-${theme}`}
+                    url={theme === 'dark' ? MAP_TILE_DARK : MAP_TILE_LIGHT}
+                    attribution="&copy; OpenStreetMap &copy; CARTO"
+                    noWrap={false}
+                  />
+                  <ZoomControl position="bottomright" />
+                  <FlyToSelection target={selectedLatLng} />
 
-          {/* Top-left: incident counter + filter */}
-          <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 1000, display: 'flex', gap: 8 }}>
-            <div style={{ background: 'rgba(10,15,30,0.88)', border: '1px solid var(--glass-border)', borderRadius: 10, padding: '8px 14px', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#ef4444', boxShadow: '0 0 8px #ef4444', display: 'block' }}></span>
-              <span style={{ fontSize: 13, fontWeight: 700 }}>{filteredRequests.length} Active Incidents</span>
+                  {filteredRequests.map(req => {
+                    const latLng = getLatLng(req.location?.coordinates)
+                    if (!latLng) return null
+                    const color = URGENCY_COLORS[req.urgency] || '#60a5fa'
+                    return (
+                      <CircleMarker
+                        key={req._id}
+                        center={latLng}
+                        radius={req.urgency === 'critical' ? 11 : 8}
+                        pathOptions={{ color, fillColor: color, fillOpacity: 0.75, weight: 2 }}
+                        eventHandlers={{ click: () => setSelectedRequest(req) }}
+                      >
+                        <Tooltip>{`${TYPE_LABELS[req.type] || req.type} - ${req.urgency}`}</Tooltip>
+                        <Popup>
+                          <div>
+                            <div style={{ fontWeight: 700, textTransform: 'capitalize' }}>{TYPE_LABELS[req.type] || req.type}</div>
+                            <div style={{ fontSize: 12, marginTop: 4 }}>{req.location.address || 'Coordinates only'}</div>
+                            <div style={{ fontSize: 12, marginTop: 2 }}>{req.status.replace('_', ' ')}</div>
+                          </div>
+                        </Popup>
+                      </CircleMarker>
+                    )
+                  })}
+
+                  {volunteerMarkers.map(({ actor, latLng }) => (
+                    <CircleMarker key={`vol-${actor._id}`} center={latLng} radius={6} pathOptions={{ color: actor.isAvailable ? '#3b82f6' : '#64748b', fillColor: actor.isAvailable ? '#3b82f6' : '#64748b', fillOpacity: 0.85, weight: 2 }}>
+                      <Tooltip>{`Volunteer: ${actor.name}`}</Tooltip>
+                    </CircleMarker>
+                  ))}
+
+                  {userMarkers.map(({ actor, latLng }) => (
+                    <CircleMarker key={`user-${actor._id}`} center={latLng} radius={5} pathOptions={{ color: '#a855f7', fillColor: '#a855f7', fillOpacity: 0.75, weight: 2 }}>
+                      <Tooltip>{`User: ${actor.name}`}</Tooltip>
+                    </CircleMarker>
+                  ))}
+                </MapContainer>
+              )}
             </div>
-            <button onClick={() => setShowFilters(p => !p)} style={{ background: 'rgba(10,15,30,0.88)', border: '1px solid var(--glass-border)', borderRadius: 10, padding: '8px 12px', backdropFilter: 'blur(16px)', cursor: 'pointer', color: showFilters ? 'var(--color-primary)' : 'var(--color-text)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 500 }}>
-              <Filter size={14} />Filter
-            </button>
+
+            <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 500, display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div style={{ background: panelBg, border: panelBorder, borderRadius: 10, padding: '8px 12px', backdropFilter: 'blur(14px)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#ef4444', boxShadow: '0 0 8px #ef4444', display: 'block' }}></span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: panelText }}>{filteredRequests.length} Active Incidents</span>
+              </div>
+
+              <div style={{ background: panelBg, border: panelBorder, borderRadius: 10, padding: 4, backdropFilter: 'blur(14px)', display: 'flex', gap: 4 }}>
+                <button
+                  onClick={() => setViewMode('globe')}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 8,
+                    border: viewMode === 'globe' ? '1px solid rgba(255,255,255,0.25)' : '1px solid transparent',
+                    cursor: 'pointer',
+                    background: viewMode === 'globe' ? activeToggleBg : inactiveToggleBg,
+                    color: viewMode === 'globe' ? activeToggleText : inactiveToggleText,
+                    boxShadow: viewMode === 'globe' ? '0 6px 16px rgba(37,99,235,0.35)' : 'none',
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  Globe View
+                </button>
+                <button
+                  onClick={() => setViewMode('map')}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 8,
+                    border: viewMode === 'map' ? '1px solid rgba(255,255,255,0.25)' : '1px solid transparent',
+                    cursor: 'pointer',
+                    background: viewMode === 'map' ? activeToggleBg : inactiveToggleBg,
+                    color: viewMode === 'map' ? activeToggleText : inactiveToggleText,
+                    boxShadow: viewMode === 'map' ? '0 6px 16px rgba(37,99,235,0.35)' : 'none',
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  Map View
+                </button>
+              </div>
+
+              <button onClick={() => setShowFilters(p => !p)} style={{ background: panelBg, border: panelBorder, borderRadius: 10, padding: '8px 12px', backdropFilter: 'blur(14px)', cursor: 'pointer', color: showFilters ? '#60a5fa' : panelText, display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 500 }}>
+                <Filter size={14} />Filters
+              </button>
+            </div>
 
             {showFilters && (
-              <div className="fade-in" style={{ background: 'rgba(17,24,39,0.95)', border: '1px solid var(--glass-border)', borderRadius: 10, padding: 14, backdropFilter: 'blur(16px)', display: 'flex', gap: 10, alignItems: 'center' }}>
+              <div style={{ position: 'absolute', top: 60, left: 12, zIndex: 500, background: panelBg, border: panelBorder, borderRadius: 10, padding: 10, backdropFilter: 'blur(12px)', display: 'flex', gap: 8, alignItems: 'center' }}>
                 <select value={filterUrgency} onChange={e => setFilterUrgency(e.target.value)} className="input-field" style={{ width: 'auto', fontSize: 12, padding: '6px 10px' }}>
-                  <option value="all">All Urgency</option>
-                  <option value="critical">🔴 Critical</option>
-                  <option value="high">🟠 High</option>
-                  <option value="medium">🟡 Medium</option>
-                  <option value="low">🟢 Low</option>
+                  <option value="all">All urgency</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
                 </select>
+
                 <select value={filterType} onChange={e => setFilterType(e.target.value)} className="input-field" style={{ width: 'auto', fontSize: 12, padding: '6px 10px' }}>
-                  <option value="all">All Types</option>
-                  <option value="rescue">🚁 Rescue</option>
-                  <option value="medical">🏥 Medical</option>
-                  <option value="food">🍱 Food</option>
-                  <option value="water">💧 Water</option>
-                  <option value="shelter">⛺ Shelter</option>
+                  <option value="all">All types</option>
+                  <option value="rescue">Rescue</option>
+                  <option value="medical">Medical</option>
+                  <option value="food">Food</option>
+                  <option value="water">Water</option>
+                  <option value="shelter">Shelter</option>
                 </select>
+
                 {(filterUrgency !== 'all' || filterType !== 'all') && (
                   <button onClick={() => { setFilterUrgency('all'); setFilterType('all') }} style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 12, display: 'flex', alignItems: 'center', gap: 3 }}>
                     <X size={13} />Clear
@@ -260,112 +587,157 @@ export default function HomePage() {
                 )}
               </div>
             )}
-          </div>
 
-          {/* Legend */}
-          <div style={{ position: 'absolute', bottom: 50, left: 14, zIndex: 1000, background: 'rgba(10,15,30,0.88)', border: '1px solid var(--glass-border)', borderRadius: 10, padding: '10px 14px', backdropFilter: 'blur(16px)' }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', letterSpacing: 1, marginBottom: 8, textTransform: 'uppercase' }}>Urgency</div>
-            {Object.entries(URGENCY_COLORS).map(([level, color]) => (
-              <div key={level} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
-                <span style={{ width: 10, height: 10, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}88`, display: 'block' }}></span>
-                <span style={{ fontSize: 12, textTransform: 'capitalize', color: 'var(--color-text-muted)' }}>{level}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* SOS FAB — users */}
-          {user?.role === 'user' && (
-            <button onClick={() => navigate('/sos')} className="sos-btn" style={{
-              position: 'absolute', bottom: 32, left: '50%', transform: 'translateX(-50%)',
-              zIndex: 1000, background: 'linear-gradient(135deg,#ef4444,#b91c1c)', color: 'white',
-              border: '3px solid rgba(255,255,255,0.3)', borderRadius: 50, padding: '16px 36px',
-              fontSize: 17, fontWeight: 900, letterSpacing: 2, cursor: 'pointer',
-              display: 'flex', alignItems: 'center', gap: 10, boxShadow: '0 8px 32px rgba(239,68,68,0.5)'
-            }}>
-              <AlertTriangle size={20} />SEND SOS
-            </button>
-          )}
-
-          {/* Guest CTA */}
-          {!user && (
-            <div style={{
-              position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)',
-              zIndex: 1000, background: 'rgba(10,15,30,0.92)', border: '1px solid var(--glass-border)',
-              borderRadius: 14, padding: '16px 28px', textAlign: 'center', backdropFilter: 'blur(16px)', minWidth: 320
-            }}>
-              <p style={{ fontSize: 14, color: 'var(--color-text-muted)', marginBottom: 12 }}>
-                🌍 <strong style={{ color: 'white' }}>DisasterLink</strong> — Real-time disaster coordination
-              </p>
-              <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
-                <Link to="/register?role=user" className="btn-primary" style={{ textDecoration: 'none', padding: '8px 18px', fontSize: 13 }}>🆘 Need Help?</Link>
-                <Link to="/register?role=volunteer" className="btn-secondary" style={{ textDecoration: 'none', padding: '8px 18px', fontSize: 13 }}>🤝 Volunteer</Link>
-                <Link to="/login" className="btn-secondary" style={{ textDecoration: 'none', padding: '8px 18px', fontSize: 13 }}>Login</Link>
-              </div>
+            <div style={{ position: 'absolute', bottom: 16, left: 12, zIndex: 500, background: panelBg, border: panelBorder, borderRadius: 10, padding: '10px 12px', backdropFilter: 'blur(14px)' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: panelMuted, letterSpacing: 1, marginBottom: 7, textTransform: 'uppercase' }}>Urgency</div>
+              {Object.entries(URGENCY_COLORS).map(([level, color]) => (
+                <div key={level} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}88`, display: 'block' }}></span>
+                  <span style={{ fontSize: 12, textTransform: 'capitalize', color: panelText }}>{level}</span>
+                </div>
+              ))}
+              {user?.role === 'admin' && (
+                <>
+                  <div style={{ marginTop: 8, fontSize: 11, color: panelMuted, fontWeight: 700, textTransform: 'uppercase' }}>Actors</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 4 }}>
+                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#3b82f6', display: 'block' }}></span>
+                    <span style={{ fontSize: 12, color: panelText }}>Volunteers</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 4 }}>
+                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#a855f7', display: 'block' }}></span>
+                    <span style={{ fontSize: 12, color: panelText }}>Users</span>
+                  </div>
+                </>
+              )}
             </div>
-          )}
+
+            {selectedRequest && (
+              <div style={{ position: 'absolute', right: 12, bottom: 16, zIndex: 520, width: 300, background: panelBg, border: panelBorder, borderRadius: 12, backdropFilter: 'blur(14px)', boxShadow: '0 12px 24px rgba(0,0,0,0.3)', padding: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'start' }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: panelText, textTransform: 'capitalize' }}>
+                    {TYPE_LABELS[selectedRequest.type] || selectedRequest.type} incident
+                  </div>
+                  <button onClick={() => setSelectedRequest(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: panelMuted }}>
+                    <X size={14} />
+                  </button>
+                </div>
+                <div style={{ display: 'flex', gap: 6, marginTop: 8, marginBottom: 8 }}>
+                  <span className={`badge badge-${selectedRequest.urgency}`}>{selectedRequest.urgency}</span>
+                  <span className={`badge badge-${selectedRequest.status}`}>{selectedRequest.status.replace('_', ' ')}</span>
+                </div>
+                {selectedRequest.description && <p style={{ color: panelMuted, fontSize: 12, lineHeight: 1.5, marginBottom: 8 }}>{selectedRequest.description}</p>}
+                <div style={{ fontSize: 12, color: panelMuted, display: 'flex', gap: 5, alignItems: 'center' }}>
+                  <MapPin size={12} />{selectedRequest.location.address || 'Coordinates only'}
+                </div>
+                <div style={{ fontSize: 11, color: panelMuted, marginTop: 6 }}>{timeAgo(selectedRequest.createdAt)}</div>
+              </div>
+            )}
+
+            {!user && (
+              <div style={{ position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 500, background: panelBg, border: panelBorder, borderRadius: 12, padding: '12px 16px', textAlign: 'center', backdropFilter: 'blur(14px)', minWidth: 320 }}>
+                <p style={{ fontSize: 13, color: panelMuted, marginBottom: 10 }}>
+                  Global disaster monitoring in real-time
+                </p>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+                  <Link to="/register?role=user" className="btn-primary" style={{ textDecoration: 'none', padding: '7px 14px', fontSize: 12 }}>Need Help?</Link>
+                  <Link to="/register?role=volunteer" className="btn-secondary" style={{ textDecoration: 'none', padding: '7px 14px', fontSize: 12 }}>Volunteer</Link>
+                  <Link to="/login" className="btn-secondary" style={{ textDecoration: 'none', padding: '7px 14px', fontSize: 12 }}>Login</Link>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* ── Sidebar ── */}
         {user && sidebarOpen && (
           <div style={{ width: 300, background: 'var(--color-surface)', borderLeft: '1px solid var(--glass-border)', display: 'flex', flexDirection: 'column', overflow: 'hidden', flexShrink: 0 }}>
             <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
               <div>
                 <h2 style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>Live Incidents</h2>
-                <p style={{ fontSize: 11, color: '#6b7280', marginTop: 2 }}>{filteredRequests.length} active</p>
+                <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 2 }}>{filteredRequests.length} active</p>
               </div>
               <button onClick={() => setSidebarOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer' }}>
                 <X size={16} />
               </button>
             </div>
+
             <div style={{ flex: 1, overflowY: 'auto' }}>
               {filteredRequests.length === 0 ? (
                 <div style={{ padding: 28, textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 13 }}>
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>🎉</div>
-                  No active incidents!
+                  No active incidents
                 </div>
               ) : (
                 filteredRequests.map(req => (
-                  <div key={req._id} className="fade-in" style={{
-                    padding: '12px 14px', borderBottom: '1px solid rgba(255,255,255,0.03)',
-                    cursor: 'pointer', transition: 'background 0.15s',
-                    borderLeft: `3px solid ${URGENCY_COLORS[req.urgency] || 'transparent'}`
-                  }}
-                    onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.03)')}
-                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  <button
+                    key={req._id}
+                    onClick={() => {
+                      setSelectedRequest(req)
+                      if (viewMode === 'globe') {
+                        const latLng = getLatLng(req.location?.coordinates)
+                        if (latLng) globeRef.current?.pointOfView({ lat: latLng[0], lng: latLng[1], altitude: 1.9 }, 900)
+                      } else {
+                        setViewMode('map')
+                      }
+                    }}
+                    style={{
+                      width: '100%',
+                      textAlign: 'left',
+                      padding: '12px 14px',
+                      border: 'none',
+                      borderBottom: '1px solid rgba(255,255,255,0.03)',
+                      cursor: 'pointer',
+                      transition: 'background-color 0.15s',
+                      borderLeft: `3px solid ${URGENCY_COLORS[req.urgency] || 'transparent'}`,
+                      background: selectedRequest?._id === req._id ? 'rgba(59,130,246,0.12)' : 'transparent',
+                    }}
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
-                      <span style={{ fontWeight: 600, fontSize: 14 }}>{TYPE_EMOJI[req.type]} {req.type}</span>
+                      <span style={{ fontWeight: 600, fontSize: 14, textTransform: 'capitalize' }}>{TYPE_LABELS[req.type] || req.type}</span>
                       <span className={`badge badge-${req.urgency}`}>{req.urgency}</span>
                     </div>
+
                     {req.description && (
                       <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 5, lineHeight: 1.4 }}>
-                        {req.description.slice(0, 70)}{req.description.length > 70 ? '...' : ''}
+                        {req.description.slice(0, 70)}
+                        {req.description.length > 70 ? '...' : ''}
                       </p>
                     )}
-                    {req.location.address && (
-                      <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 5, display: 'flex', gap: 4 }}>
-                        <MapPin size={10} />{req.location.address}
-                      </p>
-                    )}
+
+                    <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 5, display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <MapPin size={10} />{req.location.address || 'Coordinates only'}
+                    </p>
+
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <span className={`badge badge-${req.status}`}>{req.status.replace('_', ' ')}</span>
-                      <span style={{ fontSize: 11, color: '#6b7280' }}>{timeAgo(req.createdAt)}</span>
+                      <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{timeAgo(req.createdAt)}</span>
                     </div>
-                  </div>
+                  </button>
                 ))
               )}
             </div>
           </div>
         )}
 
-        {/* Toggle sidebar button when closed */}
         {user && !sidebarOpen && (
-          <button onClick={() => setSidebarOpen(true)} style={{
-            position: 'absolute', right: 0, top: '50%', transform: 'translateY(-50%)',
-            zIndex: 1000, background: 'var(--color-surface)', border: '1px solid var(--glass-border)',
-            borderRight: 'none', borderRadius: '8px 0 0 8px', padding: '12px 6px', cursor: 'pointer',
-            color: 'var(--color-text-muted)', display: 'flex', flexDirection: 'column', gap: 3,
-          }}>
+          <button
+            onClick={() => setSidebarOpen(true)}
+            style={{
+              position: 'absolute',
+              right: 0,
+              top: '50%',
+              transform: 'translateY(-50%)',
+              zIndex: 600,
+              background: 'var(--color-surface)',
+              border: '1px solid var(--glass-border)',
+              borderRight: 'none',
+              borderRadius: '8px 0 0 8px',
+              padding: '12px 6px',
+              cursor: 'pointer',
+              color: 'var(--color-text-muted)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 3,
+            }}
+          >
             <span style={{ fontSize: 10, writingMode: 'vertical-rl', color: 'var(--color-text-muted)', letterSpacing: 1 }}>INCIDENTS</span>
           </button>
         )}

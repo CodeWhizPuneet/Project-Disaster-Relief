@@ -4,6 +4,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 import { Package, Plus, Trash2, Edit2, AlertTriangle, LogOut, MapPin, X, Check } from 'lucide-react'
+import { ThemeToggle } from '../components/ThemeToggle'
 
 interface Resource {
   _id: string; name: string; type: string; quantity: number; unit: string
@@ -94,9 +95,12 @@ export default function ResourcesPage() {
             <h1 style={{ fontSize: 22, fontWeight: 800 }}>📦 Resource Inventory</h1>
             <p style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>{resources.length} resources tracked</p>
           </div>
-          <button onClick={() => { setShowForm(true); setEditId(null); setForm(defaultForm) }} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Plus size={16} />Add Resource
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <ThemeToggle compact />
+            <button onClick={() => { setShowForm(true); setEditId(null); setForm(defaultForm) }} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Plus size={16} />Add Resource
+            </button>
+          </div>
         </div>
 
         {/* Add/Edit form */}
@@ -155,8 +159,8 @@ export default function ResourcesPage() {
                 <div style={{ fontSize: 28, marginBottom: 10 }}>{TYPE_ICONS[res.type] || '📦'}</div>
                 <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>{res.name}</h3>
                 <div style={{ fontSize: 13, color: 'var(--color-text-muted)', marginBottom: 12, textTransform: 'capitalize' }}>{res.type}</div>
-                <div style={{ fontSize: 28, fontWeight: 800, color: isLow ? '#ef4444' : '#f9fafb', marginBottom: 2 }}>{res.quantity}</div>
-                <div style={{ fontSize: 13, color: 'var(--color-text-muted)', marginBottom: 12 }}>{res.unit}</div>
+                <div style={{ fontSize: 30, fontWeight: 900, color: isLow ? '#dc2626' : 'var(--color-text)', marginBottom: 2, letterSpacing: '-0.3px', lineHeight: 1.1 }}>{res.quantity}</div>
+                <div style={{ fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 12, fontWeight: 600 }}>{res.unit}</div>
                 {res.location?.campName && (
                   <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 14 }}>
                     <MapPin size={12} />{res.location.campName}

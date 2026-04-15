@@ -42,6 +42,20 @@ const userSchema = new mongoose.Schema(
         default: [0, 0],
       },
     },
+    locationUpdatedAt: {
+      type: Date,
+      default: null,
+    },
+    trackingStatus: {
+      type: String,
+      enum: ['offline', 'available', 'assigned'],
+      default: 'offline',
+    },
+    assignedIncidentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Request',
+      default: null,
+    },
     isAvailable: {
       type: Boolean,
       default: true,
@@ -55,6 +69,7 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.index({ location: '2dsphere' });
+userSchema.index({ role: 1, isAvailable: 1, trackingStatus: 1 });
 
 userSchema.pre('save', async function saveHook() {
   if (!this.isModified('password')) return;
@@ -75,7 +90,10 @@ userSchema.methods.toSafeObject = function toSafeObject() {
     role: this.role,
     phone: this.phone,
     isAvailable: this.isAvailable,
+    trackingStatus: this.trackingStatus,
+    assignedIncidentId: this.assignedIncidentId,
     location: this.location,
+    locationUpdatedAt: this.locationUpdatedAt,
     createdAt: this.createdAt,
     updatedAt: this.updatedAt,
   };

@@ -5,6 +5,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 import { exportCSV } from '../utils/exportCSV'
+import { ThemeToggle } from '../components/ThemeToggle'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend
@@ -42,6 +43,28 @@ const AssignModal = ({ request, volunteers, onClose, onAssigned }: {
   const [selectedVol, setSelectedVol] = useState('')
   const [notes, setNotes] = useState('')
   const [loading, setLoading] = useState(false)
+  const [autoAssigning, setAutoAssigning] = useState(false)
+  const [suggestions, setSuggestions] = useState<Array<{ _id: string; distanceKm: number; hasLiveLocation?: boolean }>>([])
+
+  useEffect(() => {
+    let mounted = true
+
+    const loadSuggestions = async () => {
+      try {
+        const { data } = await axios.get(`/api/tasks/suggestions/${request._id}`, { params: { limit: 5 } })
+        if (!mounted) return
+        setSuggestions(data?.data || [])
+      } catch {
+        if (!mounted) return
+        setSuggestions([])
+      }
+    }
+
+    loadSuggestions()
+    return () => {
+      mounted = false
+    }
+  }, [request._id])
 
   const handleAssign = async () => {
     if (!selectedVol) { toast.error('Select a volunteer'); return }
@@ -53,6 +76,20 @@ const AssignModal = ({ request, volunteers, onClose, onAssigned }: {
     } catch (err: any) {
       toast.error(err?.response?.data?.message || 'Assignment failed')
     } finally { setLoading(false) }
+  }
+
+  const handleAutoAssign = async () => {
+    setAutoAssigning(true)
+    try {
+      await axios.post(`/api/tasks/auto-assign/${request._id}`, { notes })
+      toast.success('Nearest volunteer auto-assigned')
+      onAssigned()
+      onClose()
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Auto-assignment failed')
+    } finally {
+      setAutoAssigning(false)
+    }
   }
 
   const availableVols = volunteers.filter(v => v.isAvailable)
@@ -114,12 +151,53 @@ const AssignModal = ({ request, volunteers, onClose, onAssigned }: {
           )}
         </div>
 
+        {suggestions.length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6, fontWeight: 600 }}>
+              Nearest Volunteers
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {suggestions.map(item => {
+                const vol = availableVols.find(v => v._id === item._id)
+                if (!vol) return null
+
+                return (
+                  <button
+                    type="button"
+                    key={item._id}
+                    onClick={() => setSelectedVol(item._id)}
+                    style={{
+                      borderRadius: 18,
+                      border: selectedVol === item._id ? '1px solid rgba(34,197,94,0.7)' : '1px solid var(--glass-border)',
+                      background: selectedVol === item._id ? 'rgba(34,197,94,0.14)' : 'var(--glass-bg)',
+                      color: 'var(--color-text)',
+                      padding: '5px 10px',
+                      fontSize: 12,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {vol.name} · {Number.isFinite(item.distanceKm) ? `${item.distanceKm} km` : 'unknown'}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
         <div style={{ marginBottom: 18 }}>
           <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>Notes for Volunteer (optional)</label>
           <textarea className="input-field" rows={2} placeholder="e.g., Bring rescue equipment, access from north gate..." value={notes} onChange={e => setNotes(e.target.value)} style={{ resize: 'none' }} />
         </div>
 
         <div style={{ display: 'flex', gap: 10 }}>
+          <button
+            onClick={handleAutoAssign}
+            disabled={autoAssigning || loading}
+            className="btn-secondary"
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+          >
+            <Zap size={16} />{autoAssigning ? 'Assigning...' : 'Auto Assign Nearest'}
+          </button>
           <button onClick={handleAssign} disabled={loading || !selectedVol} className="btn-primary" style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
             <UserCheck size={16} />{loading ? 'Assigning...' : 'Confirm Assignment'}
           </button>
@@ -279,12 +357,13 @@ export default function AdminDashboard() {
       {/* Main Content */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Top bar */}
-        <div style={{ padding: '14px 24px', borderBottom: '1px solid var(--glass-border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, background: 'rgba(17,24,39,0.8)' }}>
+        <div style={{ padding: '14px 24px', borderBottom: '1px solid var(--glass-border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, background: 'var(--glass-bg)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className="conn-dot" style={{ background: connected ? '#22c55e' : '#ef4444', boxShadow: connected ? '0 0 6px #22c55e' : 'none' }}></span>
-            <span style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>{connected ? 'Live — Real-time updates active' : 'Connecting...'}</span>
+            <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>{connected ? 'Live — Real-time updates active' : 'Connecting...'}</span>
           </div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <ThemeToggle compact />
             <button onClick={fetchAll} className="btn-secondary" style={{ padding: '7px 12px', fontSize: 12, display: 'flex', alignItems: 'center', gap: 5 }}>
               <RefreshCw size={13} />Refresh
             </button>
@@ -349,10 +428,10 @@ export default function AdminDashboard() {
                   <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 18 }}>📊 Requests by Type</h3>
                   <ResponsiveContainer width="100%" height={200}>
                     <BarChart data={byType} barSize={32}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                      <XAxis dataKey="name" tick={{ fill: '#9ca3af', fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <YAxis tick={{ fill: '#9ca3af', fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, color: '#f9fafb', fontSize: 13 }} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--glass-border)" vertical={false} />
+                      <XAxis dataKey="name" tick={{ fill: 'var(--color-text-muted)', fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: 'var(--color-text-muted)', fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <Tooltip contentStyle={{ background: 'var(--color-surface)', border: '1px solid var(--glass-border)', borderRadius: 8, color: 'var(--color-text)', fontSize: 13 }} cursor={{ fill: 'rgba(148,163,184,0.12)' }} />
                       <Bar dataKey="count" radius={[4, 4, 0, 0]}>
                         {byType.map((_: any, i: number) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
                       </Bar>
@@ -367,8 +446,8 @@ export default function AdminDashboard() {
                       <Pie data={byStatus} dataKey="count" nameKey="name" cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={3}>
                         {byStatus.map((_: any, i: number) => <Cell key={i} fill={Object.values(STATUS_COLOR)[i % 5]} />)}
                       </Pie>
-                      <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }} />
-                      <Legend formatter={(v) => <span style={{ fontSize: 12, color: '#9ca3af', textTransform: 'capitalize' }}>{v}</span>} />
+                      <Tooltip contentStyle={{ background: 'var(--color-surface)', border: '1px solid var(--glass-border)', borderRadius: 8, color: 'var(--color-text)' }} />
+                      <Legend formatter={(v) => <span style={{ fontSize: 12, color: 'var(--color-text-muted)', textTransform: 'capitalize' }}>{v}</span>} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>

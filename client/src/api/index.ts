@@ -51,6 +51,8 @@ export const taskAPI = {
   getAll: () => api.get('/tasks'),
   getMyTasks: () => api.get('/tasks/my-tasks'),
   create: (data: any) => api.post('/tasks', data),
+  getSuggestions: (requestId: string, limit = 5) => api.get(`/tasks/suggestions/${requestId}`, { params: { limit } }),
+  autoAssignNearest: (requestId: string) => api.post(`/tasks/auto-assign/${requestId}`),
   updateStatus: (id: string, status: string, notes?: string) => api.patch(`/tasks/${id}/status`, { status, notes }),
 }
 

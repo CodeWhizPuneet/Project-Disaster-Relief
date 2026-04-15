@@ -79,9 +79,14 @@ const getMe = async (req, res) => {
 
 const updateAvailability = async (req, res) => {
   try {
+    const isAvailable = Boolean(req.body.isAvailable);
     const user = await User.findByIdAndUpdate(
       req.user._id,
-      { isAvailable: Boolean(req.body.isAvailable) },
+      {
+        isAvailable,
+        trackingStatus: isAvailable ? 'available' : 'offline',
+        assignedIncidentId: isAvailable ? null : req.user.assignedIncidentId || null,
+      },
       {
         returnDocument: 'after',
         runValidators: true,

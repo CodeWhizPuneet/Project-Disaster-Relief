@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import toast from 'react-hot-toast'
 import { AlertTriangle, Mail, Lock, User, Phone, Heart } from 'lucide-react'
+import { ThemeToggle } from '../components/ThemeToggle'
 
 const roles = [
   { value: 'user', label: 'I need help', icon: User, desc: 'Submit emergency SOS requests' },
@@ -47,8 +48,12 @@ export default function RegisterPage() {
       minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
       background: 'var(--color-bg)',
       backgroundImage: 'radial-gradient(ellipse at 20% 50%, rgba(239,68,68,0.08) 0%, transparent 60%)',
-      padding: 20
+      padding: 20,
+      position: 'relative'
     }}>
+      <div style={{ position: 'absolute', top: 16, right: 16 }}>
+        <ThemeToggle compact />
+      </div>
       <div className="glass fade-in" style={{ width: '100%', maxWidth: 460, padding: 40 }}>
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <div style={{ display: 'inline-flex', background: '#ef4444', borderRadius: 12, padding: 12, marginBottom: 12 }}>

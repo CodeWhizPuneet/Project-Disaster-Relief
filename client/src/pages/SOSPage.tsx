@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 import { AlertTriangle, MapPin, ChevronRight, ChevronLeft, CheckCircle, Navigation } from 'lucide-react'
+import { ThemeToggle } from '../components/ThemeToggle'
 
 delete (L.Icon.Default.prototype as any)._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -80,7 +81,10 @@ export default function SOSPage() {
   }
 
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--color-bg)', backgroundImage: 'radial-gradient(ellipse at 20% 50%, rgba(239,68,68,0.1) 0%, transparent 60%)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+    <div style={{ minHeight: '100vh', background: 'var(--color-bg)', backgroundImage: 'radial-gradient(ellipse at 20% 50%, rgba(239,68,68,0.1) 0%, transparent 60%)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, position: 'relative' }}>
+      <div style={{ position: 'absolute', top: 16, right: 16 }}>
+        <ThemeToggle compact />
+      </div>
       <div className="glass fade-in" style={{ width: '100%', maxWidth: 560, padding: 36 }}>
         {/* Header */}
         {step < 5 && (
@@ -163,8 +167,8 @@ export default function SOSPage() {
               </button>
             </div>
             <div style={{ height: 280, borderRadius: 10, overflow: 'hidden', border: '1px solid var(--glass-border)' }}>
-              <MapContainer center={[form.location.lat, form.location.lng] as [number, number]} zoom={5} style={{ height: '100%', width: '100%' }}>
-                <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" />
+              <MapContainer center={[form.location.lat, form.location.lng] as [number, number]} zoom={5} worldCopyJump style={{ height: '100%', width: '100%' }}>
+                <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" noWrap={false} />
                 <LocationPicker onPick={(lat, lng) => { setForm(p => ({ ...p, location: { lat, lng, address: `${lat.toFixed(4)}, ${lng.toFixed(4)}` } })); toast.success('Location pinned!') }} />
                 {form.location.lat !== 20.5937 && (
                   <Marker position={[form.location.lat, form.location.lng] as [number, number]} />

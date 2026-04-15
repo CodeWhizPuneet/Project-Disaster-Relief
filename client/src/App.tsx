@@ -68,9 +68,9 @@ const App = () => (
       <Toaster
         position="top-right"
         toastOptions={{
-          style: { background: '#1f2937', color: '#f9fafb', border: '1px solid rgba(255,255,255,0.1)', fontSize: 14 },
-          success: { iconTheme: { primary: '#22c55e', secondary: '#1f2937' } },
-          error: { iconTheme: { primary: '#ef4444', secondary: '#1f2937' } },
+          style: { background: 'var(--color-surface)', color: 'var(--color-text)', border: '1px solid var(--glass-border)', fontSize: 14 },
+          success: { iconTheme: { primary: '#22c55e', secondary: '#111827' } },
+          error: { iconTheme: { primary: '#ef4444', secondary: '#111827' } },
         }}
       />
       <AppRoutes />

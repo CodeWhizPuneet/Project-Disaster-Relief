@@ -25,6 +25,9 @@ export const useSocket = (user: SocketUser) => {
       path: '/socket.io',
       withCredentials: true,
       transports: ['websocket'],
+      auth: {
+        token: localStorage.getItem('token'),
+      },
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,

@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import toast from 'react-hot-toast'
 import { AlertTriangle, Mail, Lock, Eye, EyeOff } from 'lucide-react'
+import { ThemeToggle } from '../components/ThemeToggle'
 
 export default function LoginPage() {
   const { login } = useAuth()
@@ -36,8 +37,12 @@ export default function LoginPage() {
       minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
       background: 'var(--color-bg)',
       backgroundImage: 'radial-gradient(ellipse at 20% 50%, rgba(239,68,68,0.08) 0%, transparent 60%), radial-gradient(ellipse at 80% 20%, rgba(59,130,246,0.05) 0%, transparent 60%)',
-      padding: 20
+      padding: 20,
+      position: 'relative'
     }}>
+      <div style={{ position: 'absolute', top: 16, right: 16 }}>
+        <ThemeToggle compact />
+      </div>
       <div className="glass fade-in" style={{ width: '100%', maxWidth: 420, padding: 40 }}>
         <div style={{ textAlign: 'center', marginBottom: 32 }}>
           <div style={{ display: 'inline-flex', background: '#ef4444', borderRadius: 12, padding: 12, marginBottom: 12 }}>
