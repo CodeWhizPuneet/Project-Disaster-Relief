@@ -2,9 +2,10 @@ const Task = require('../models/Task');
 const Request = require('../models/Request');
 const User = require('../models/User');
 const { haversineDistanceKm } = require('../utils/geo');
+const { cancelDispatch } = require('../services/dispatchService');
 
 const setVolunteerAssignmentState = async ({ volunteerId, incidentId, isAssigned }) => {
-  await User.findByIdAndUpdate(
+  return User.findByIdAndUpdate(
     volunteerId,
     {
       isAvailable: !isAssigned,
@@ -12,7 +13,25 @@ const setVolunteerAssignmentState = async ({ volunteerId, incidentId, isAssigned
       assignedIncidentId: isAssigned ? incidentId : null,
     },
     { returnDocument: 'after' }
-  );
+  ).select('isAvailable trackingStatus assignedIncidentId location locationUpdatedAt');
+};
+
+const mapVolunteerStatusPayload = (volunteerId, volunteerState) => {
+  const coordinates = volunteerState?.location?.coordinates;
+  return {
+    volunteerId,
+    available: volunteerState?.isAvailable,
+    trackingStatus: volunteerState?.trackingStatus,
+    incidentId: volunteerState?.assignedIncidentId || null,
+    location:
+      Array.isArray(coordinates) && coordinates.length === 2
+        ? {
+            lat: coordinates[1],
+            lng: coordinates[0],
+          }
+        : null,
+    locationUpdatedAt: volunteerState?.locationUpdatedAt || null,
+  };
 };
 
 const createTask = async (req, res) => {
@@ -42,11 +61,14 @@ const createTask = async (req, res) => {
     request.assignedTask = task._id;
     await request.save();
 
-    await setVolunteerAssignmentState({
+    const volunteerState = await setVolunteerAssignmentState({
       volunteerId,
       incidentId: request._id,
       isAssigned: true,
     });
+
+    // Cancel any pending auto-dispatch timer for this incident
+    cancelDispatch(String(requestId));
 
     const populated = await task.populate([
       { path: 'requestId' },
@@ -72,6 +94,8 @@ const createTask = async (req, res) => {
       incidentId: request._id,
       isAvailable: false,
     });
+
+    req.io.to('staff').emit('volunteer_status_update', mapVolunteerStatusPayload(volunteerId, volunteerState));
 
     req.io.to(incidentRoom).emit('incident_assignment_updated', {
       incidentId: request._id,
@@ -113,6 +137,7 @@ const getMyTasks = async (req, res) => {
 const updateTaskStatus = async (req, res) => {
   try {
     const { status, notes } = req.body;
+    const normalizedStatus = status === 'en_route' ? 'in_progress' : status;
 
     const task = await Task.findOne({
       _id: req.params.id,
@@ -123,21 +148,26 @@ const updateTaskStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Task not found or not yours' });
     }
 
-    task.status = status;
+    task.status = normalizedStatus;
     if (notes) task.notes = notes;
 
     let linkedRequestStatus = null;
 
-    if (status === 'completed') {
+    if (normalizedStatus === 'completed') {
       task.completedAt = new Date();
       linkedRequestStatus = 'resolved';
       await Request.findByIdAndUpdate(task.requestId, { status: linkedRequestStatus }, { returnDocument: 'after' });
-      await setVolunteerAssignmentState({
+      const volunteerState = await setVolunteerAssignmentState({
         volunteerId: task.volunteerId,
         incidentId: task.requestId,
         isAssigned: false,
       });
-    } else if (status === 'en_route') {
+
+      req.io.to('staff').emit(
+        'volunteer_status_update',
+        mapVolunteerStatusPayload(task.volunteerId, volunteerState)
+      );
+    } else if (normalizedStatus === 'in_progress') {
       linkedRequestStatus = 'in_progress';
       await Request.findByIdAndUpdate(task.requestId, { status: linkedRequestStatus }, { returnDocument: 'after' });
     }
@@ -157,7 +187,7 @@ const updateTaskStatus = async (req, res) => {
       });
     }
 
-    if (status === 'completed') {
+    if (normalizedStatus === 'completed') {
       const request = await Request.findById(task.requestId);
       if (request) {
         req.io.to(`user_${request.submittedBy}`).emit('sos_resolved', {

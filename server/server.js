@@ -4,12 +4,14 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 const connectDB = require('./config/db');
 const User = require('./models/User');
 const Task = require('./models/Task');
 const Request = require('./models/Request');
+const { cancelDispatch, claimRequest } = require('./services/dispatchService');
 
 const app = express();
 const server = http.createServer(app);
@@ -90,6 +92,8 @@ app.use('/api/requests', require('./routes/requestRoutes'));
 app.use('/api/tasks', require('./routes/taskRoutes'));
 app.use('/api/resources', require('./routes/resourceRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
+app.use('/api/route', require('./routes/routeRoutes'));
+app.use('/route', require('./routes/routeRoutes'));
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -125,7 +129,7 @@ const canAccessIncident = async ({ user, incidentId }) => {
     const task = await Task.findOne({
       requestId: incidentId,
       volunteerId: user._id,
-      status: { $in: ['assigned', 'accepted', 'en_route'] },
+      status: { $in: ['assigned', 'accepted', 'in_progress', 'en_route'] },
     }).select('_id');
 
     return Boolean(task);
@@ -133,6 +137,17 @@ const canAccessIncident = async ({ user, incidentId }) => {
 
   return false;
 };
+
+const hasActiveVolunteerTask = async (volunteerId) => {
+  const task = await Task.findOne({
+    volunteerId,
+    status: { $in: ['assigned', 'accepted', 'in_progress', 'en_route'] },
+  }).select('requestId status');
+
+  return task;
+};
+
+const isValidCoordinate = (value) => Number.isFinite(value) && Math.abs(value) <= 180;
 
 io.on('connection', (socket) => {
   const safeUser = socket.user?.toSafeObject ? socket.user.toSafeObject() : socket.user;
@@ -167,33 +182,73 @@ io.on('connection', (socket) => {
     if (safeUser?.role !== 'volunteer' && safeUser?.role !== 'admin') return;
     if (!volunteerId || String(volunteerId) !== String(safeUser?._id)) return;
 
-    await User.findByIdAndUpdate(volunteerId, {
-      isAvailable: Boolean(available),
-      trackingStatus: Boolean(available) ? 'available' : 'offline',
-      assignedIncidentId: Boolean(available) ? null : safeUser.assignedIncidentId || null,
-    });
+    const activeTask = await hasActiveVolunteerTask(safeUser._id);
+    if (activeTask && Boolean(available)) return;
 
-    io.to('staff').emit('volunteer_status_update', { volunteerId, available: Boolean(available) });
+    const effectiveAvailable = activeTask ? false : Boolean(available);
+    const updatedVolunteer = await User.findByIdAndUpdate(
+      volunteerId,
+      {
+        isAvailable: effectiveAvailable,
+        trackingStatus: activeTask ? 'assigned' : effectiveAvailable ? 'available' : 'offline',
+        assignedIncidentId: activeTask ? activeTask.requestId : null,
+      },
+      {
+        returnDocument: 'after',
+        runValidators: true,
+      }
+    ).select('isAvailable trackingStatus assignedIncidentId location locationUpdatedAt');
+
+    if (!updatedVolunteer) return;
+
+    io.to('staff').emit('volunteer_status_update', {
+      volunteerId,
+      available: updatedVolunteer.isAvailable,
+      trackingStatus: updatedVolunteer.trackingStatus,
+      incidentId: updatedVolunteer.assignedIncidentId,
+      location: Array.isArray(updatedVolunteer.location?.coordinates)
+        ? {
+            lat: updatedVolunteer.location.coordinates[1],
+            lng: updatedVolunteer.location.coordinates[0],
+          }
+        : null,
+      locationUpdatedAt: updatedVolunteer.locationUpdatedAt,
+    });
   });
 
   socket.on('volunteerLocationUpdate', async ({ incidentId, latitude, longitude, status }) => {
     if (safeUser?.role !== 'volunteer') return;
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+    if (!isValidCoordinate(latitude) || !isValidCoordinate(longitude)) return;
+
+    const activeTask = await hasActiveVolunteerTask(safeUser._id);
+    const effectiveIncidentId = incidentId || activeTask?.requestId?.toString() || null;
+
+    if (!incidentId && activeTask) {
+      incidentId = activeTask.requestId.toString();
+    }
+
+    if (incidentId && activeTask && String(activeTask.requestId) !== String(incidentId)) {
+      return;
+    }
+
+    if (incidentId && !activeTask) {
+      return;
+    }
 
     const coords = [Number(longitude), Number(latitude)];
-    const effectiveStatus = status || (incidentId ? 'assigned' : 'available');
+    const effectiveStatus = activeTask ? 'assigned' : status || (effectiveIncidentId ? 'assigned' : 'available');
 
     await User.findByIdAndUpdate(safeUser._id, {
       location: { type: 'Point', coordinates: coords },
       locationUpdatedAt: new Date(),
       trackingStatus: effectiveStatus,
       isAvailable: effectiveStatus === 'available',
-      assignedIncidentId: incidentId || null,
+      assignedIncidentId: effectiveIncidentId,
     });
 
     const payload = {
       volunteerId: safeUser._id,
-      incidentId: incidentId || null,
+      incidentId: effectiveIncidentId,
       location: { lat: Number(latitude), lng: Number(longitude) },
       timestamp: new Date().toISOString(),
       status: effectiveStatus,
@@ -201,18 +256,18 @@ io.on('connection', (socket) => {
 
     io.to('staff').emit('volunteer_location_updated', payload);
 
-    if (incidentId) {
-      const allowed = await canAccessIncident({ user: safeUser, incidentId });
+    if (effectiveIncidentId) {
+      const allowed = await canAccessIncident({ user: safeUser, incidentId: effectiveIncidentId });
       if (!allowed) return;
 
-      socket.join(`incident_${incidentId}`);
-      io.to(`incident_${incidentId}`).emit('volunteer_location_updated', payload);
+      socket.join(`incident_${effectiveIncidentId}`);
+      io.to(`incident_${effectiveIncidentId}`).emit('volunteer_location_updated', payload);
     }
   });
 
   socket.on('userLocationUpdate', async ({ incidentId, latitude, longitude }) => {
     if (safeUser?.role !== 'user') return;
-    if (!incidentId || !Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+    if (!incidentId || !isValidCoordinate(latitude) || !isValidCoordinate(longitude)) return;
 
     const allowed = await canAccessIncident({ user: safeUser, incidentId });
     if (!allowed) return;
@@ -251,11 +306,148 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── Auto-dispatch: volunteer accepts a dispatched SOS ────────────────────
+  /**
+   * First-accept-wins: the first volunteer to emit this event atomically claims
+   * the request. All others receive 'dispatch_already_assigned'.
+   */
+  socket.on('volunteer_accept_dispatch', async ({ requestId }) => {
+    if (safeUser?.role !== 'volunteer') return;
+    if (!requestId) return;
+
+    const volunteerId = safeUser._id;
+
+    try {
+      // Step 1: Atomically claim the request — only succeeds if status is still 'pending'
+      const request = await claimRequest(requestId);
+
+      if (!request) {
+        // Another volunteer beat us to it
+        socket.emit('dispatch_already_assigned', { requestId });
+        console.log(`[dispatch] Race lost by volunteer ${volunteerId} for incident ${requestId}`);
+        return;
+      }
+
+      // Step 2: Check volunteer is not already on a critical task
+      const existingTask = await Task.findOne({
+        volunteerId,
+        status: { $in: ['assigned', 'accepted', 'in_progress', 'en_route'] },
+      }).select('_id').lean();
+
+      // (Volunteer may still accept even if busy — dispatchService already filtered by urgency)
+      // But we don't allow two active assigned tasks
+      if (existingTask) {
+        // Roll back — un-claim request
+        await Request.findByIdAndUpdate(requestId, { status: 'pending' });
+        socket.emit('dispatch_already_assigned', { requestId });
+        console.log(`[dispatch] Volunteer ${volunteerId} already has an active task — rolled back`);
+        return;
+      }
+
+      // Step 3: Create the Task document
+      const task = await Task.create({ requestId, volunteerId });
+
+      // Step 4: Link task to request
+      await Request.findByIdAndUpdate(requestId, { assignedTask: task._id });
+
+      // Step 5: Update volunteer state
+      const volunteerState = await User.findByIdAndUpdate(
+        volunteerId,
+        {
+          isAvailable: false,
+          trackingStatus: 'assigned',
+          assignedIncidentId: request._id,
+        },
+        { returnDocument: 'after' }
+      ).select('isAvailable trackingStatus assignedIncidentId location locationUpdatedAt name phone');
+
+      // Step 6: Cancel any remaining dispatch timers
+      cancelDispatch(String(requestId));
+
+      // Step 7: Notify the accepting volunteer (task_assigned mirrors existing flow)
+      socket.join(`incident_${request._id}`);
+      socket.emit('task_assigned', {
+        taskId: task._id,
+        incidentId: request._id,
+        request: { type: request.type, urgency: request.urgency, location: request.location },
+      });
+
+      // Step 8: Notify the victim
+      io.to(`user_${request.submittedBy}`).emit('sos_assigned', {
+        message: `A volunteer has accepted your ${request.type} request. Help is on the way!`,
+        taskId: task._id,
+        incidentId: request._id,
+      });
+
+      // Step 9: Notify admin
+      io.to('staff').emit('volunteer_assignment_updated', {
+        volunteerId,
+        incidentId: request._id,
+        isAvailable: false,
+        source: 'auto_dispatch',
+      });
+
+      if (volunteerState) {
+        const coords = volunteerState.location?.coordinates;
+        io.to('staff').emit('volunteer_status_update', {
+          volunteerId,
+          available: volunteerState.isAvailable,
+          trackingStatus: volunteerState.trackingStatus,
+          incidentId: volunteerState.assignedIncidentId,
+          location: Array.isArray(coords) && coords.length === 2
+            ? { lat: coords[1], lng: coords[0] } : null,
+          locationUpdatedAt: volunteerState.locationUpdatedAt,
+        });
+      }
+
+      // Step 10: Notify incident room (victim + any admins watching)
+      io.to(`incident_${request._id}`).emit('incident_assignment_updated', {
+        incidentId: request._id,
+        volunteerId,
+        userId: request.submittedBy,
+      });
+
+      console.log(`[dispatch] Volunteer ${volunteerId} accepted incident ${requestId} ✅`);
+    } catch (err) {
+      console.error('[dispatch] Error in volunteer_accept_dispatch:', err.message);
+      socket.emit('dispatch_error', { requestId, message: 'Assignment failed. Please try again.' });
+    }
+  });
+
+  // ── Auto-dispatch: volunteer rejects a dispatched SOS ───────────────────
+  socket.on('volunteer_reject_dispatch', ({ requestId }) => {
+    if (safeUser?.role !== 'volunteer') return;
+    if (!requestId) return;
+    // Server-side we simply log. dispatchService already handles fallback via timeout.
+    console.log(`[dispatch] Volunteer ${safeUser._id} rejected incident ${requestId}`);
+    // Optionally: track rejection count and fire next round early
+    // For now, timeout handles progression automatically
+  });
+
   socket.on('disconnect', async (reason) => {
     if (safeUser?.role === 'volunteer') {
-      await User.findByIdAndUpdate(safeUser._id, {
-        trackingStatus: safeUser.assignedIncidentId ? 'assigned' : 'offline',
-      });
+      const activeTask = await hasActiveVolunteerTask(safeUser._id);
+      const updated = await User.findByIdAndUpdate(
+        safeUser._id,
+        {
+          isAvailable: !activeTask,
+          trackingStatus: activeTask ? 'assigned' : 'offline',
+          assignedIncidentId: activeTask ? activeTask.requestId : null,
+        },
+        {
+          returnDocument: 'after',
+          runValidators: true,
+        }
+      ).select('isAvailable trackingStatus assignedIncidentId');
+
+      if (updated) {
+        io.to('staff').emit('volunteer_status_update', {
+          volunteerId: safeUser._id,
+          available: updated.isAvailable,
+          trackingStatus: updated.trackingStatus,
+          incidentId: updated.assignedIncidentId,
+        });
+      }
     }
 
     console.log(`Socket disconnected: ${socket.id} (${reason})`);

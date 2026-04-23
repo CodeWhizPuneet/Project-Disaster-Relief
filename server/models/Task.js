@@ -14,7 +14,7 @@ const taskSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['assigned', 'accepted', 'en_route', 'completed', 'cancelled'],
+      enum: ['assigned', 'accepted', 'in_progress', 'en_route', 'completed', 'cancelled'],
       default: 'assigned',
     },
     notes: {

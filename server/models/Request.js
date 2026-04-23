@@ -60,6 +60,36 @@ const requestSchema = new mongoose.Schema(
       type: Number,
       default: 1,
     },
+    // Auto-dispatch tracking — set by dispatchService, never by client
+    dispatchState: {
+      round: { type: Number, default: 0 },
+      lastDispatchedAt: { type: Date, default: null },
+      dispatchedCount: { type: Number, default: 0 },
+      escalatedToAdmin: { type: Boolean, default: false },
+    },
+
+    /**
+     * routeLocation — road-snapped point computed at SOS creation via OSRM.
+     * Google Maps navigation uses this as destination instead of raw actualLocation,
+     * ensuring routing always succeeds even for off-road GPS positions.
+     * Falls back to the original location coords if OSRM is unreachable.
+     */
+    routeLocation: {
+      type: {
+        type: String,
+        enum: ['Point'],
+        default: 'Point',
+      },
+      coordinates: {
+        type: [Number],  // [longitude, latitude]
+        default: null,
+      },
+    },
+    roadSnap: {
+      distanceMeters: { type: Number, default: 0 },  // gap between GPS and road
+      roadName: { type: String, default: '' },
+      snapped: { type: Boolean, default: false },      // false = fallback used
+    },
   },
   { timestamps: true }
 );

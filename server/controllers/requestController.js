@@ -1,4 +1,15 @@
 const Request = require('../models/Request');
+const { startAutoDispatch } = require('../services/dispatchService');
+const { findNearestRoadPoint } = require('../utils/geo');
+
+const toIncidentObject = (requestDoc) => {
+  const base = typeof requestDoc?.toObject === 'function' ? requestDoc.toObject() : requestDoc;
+  return {
+    ...base,
+    entityType: 'incident',
+    requestId: base?._id,
+  };
+};
 
 const createRequest = async (req, res) => {
   try {
@@ -24,11 +35,15 @@ const createRequest = async (req, res) => {
     const populated = await newRequest.populate('submittedBy', 'name phone');
 
     req.io.to('staff').emit('new_request', {
+      entityType: 'incident',
+      _id: populated._id,
       requestId: populated._id,
       type: populated.type,
       urgency: populated.urgency,
       description: populated.description,
       location: populated.location,
+      routeLocation: populated.routeLocation || null,
+      roadSnap: populated.roadSnap || null,
       submittedBy: populated.submittedBy,
       numberOfPeople: populated.numberOfPeople,
       status: populated.status,
@@ -36,7 +51,40 @@ const createRequest = async (req, res) => {
       createdAt: populated.createdAt,
     });
 
-    return res.status(201).json({ success: true, data: populated });
+    // Road-snap + auto-dispatch run concurrently in background — non-blocking
+    const [snapLat, snapLng] = [location.lat, location.lng];
+
+    Promise.all([
+      // 1. Find nearest road point and persist it
+      findNearestRoadPoint(snapLat, snapLng).then(async (snap) => {
+        const routeCoords = [snap.lng, snap.lat]; // GeoJSON [lng, lat]
+        await Request.findByIdAndUpdate(newRequest._id, {
+          routeLocation: { type: 'Point', coordinates: routeCoords },
+          roadSnap: {
+            distanceMeters: snap.distanceMeters,
+            roadName: snap.roadName,
+            snapped: snap.distanceMeters > 0,
+          },
+        });
+        // Notify staff with updated road-snap data (volunteers may not be assigned yet)
+        req.io.to('staff').emit('incident_road_snap_updated', {
+          incidentId: newRequest._id,
+          routeLocation: { lat: snap.lat, lng: snap.lng },
+          roadSnap: {
+            distanceMeters: snap.distanceMeters,
+            roadName: snap.roadName,
+            snapped: snap.distanceMeters > 0,
+          },
+        });
+      }).catch((err) => console.error('[roadSnap] Error:', err.message)),
+
+      // 2. Auto-dispatch nearest volunteers
+      startAutoDispatch(newRequest, req.io).catch((err) =>
+        console.error('[dispatch] Auto-dispatch error:', err.message)
+      ),
+    ]);
+
+    return res.status(201).json({ success: true, data: toIncidentObject(populated) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -61,7 +109,11 @@ const getRequests = async (req, res) => {
       .sort({ priorityScore: -1, createdAt: -1 })
       .limit(Number(limit));
 
-    return res.json({ success: true, count: requests.length, data: requests });
+    return res.json({
+      success: true,
+      count: requests.length,
+      data: requests.map(toIncidentObject),
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -81,7 +133,7 @@ const getRequest = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Not authorized to access this request' });
     }
 
-    return res.json({ success: true, data: request });
+    return res.json({ success: true, data: toIncidentObject(request) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -107,7 +159,7 @@ const updateRequestStatus = async (req, res) => {
       status: request.status,
     });
 
-    return res.json({ success: true, data: request });
+    return res.json({ success: true, data: toIncidentObject(request) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -127,7 +179,11 @@ const getNearbyRequests = async (req, res) => {
       },
     }).populate('submittedBy', 'name phone');
 
-    return res.json({ success: true, count: requests.length, data: requests });
+    return res.json({
+      success: true,
+      count: requests.length,
+      data: requests.map(toIncidentObject),
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }

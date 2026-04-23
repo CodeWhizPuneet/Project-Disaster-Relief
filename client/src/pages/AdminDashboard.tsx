@@ -5,6 +5,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 import { exportCSV } from '../utils/exportCSV'
+import { timeAgo, formatExactDate } from '../utils/timeAgo'
 import { ThemeToggle } from '../components/ThemeToggle'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -16,29 +17,41 @@ import {
   RefreshCw, UserCheck, Radio, Search, Download
 } from 'lucide-react'
 
-interface SOSRequest {
+interface Incident {
   _id: string; type: string; urgency: string; status: string; description: string
+  entityType?: 'incident'
   location: { coordinates: [number, number]; address: string }
   submittedBy?: { name: string; phone: string; _id: string }
   createdAt: string; numberOfPeople?: number; priorityScore?: number
 }
 interface Volunteer {
-  _id: string; name: string; email: string; phone: string; isAvailable: boolean; createdAt: string
+  _id: string
+  name: string
+  email: string
+  phone: string
+  isAvailable: boolean
+  trackingStatus?: 'offline' | 'available' | 'assigned'
+  assignedIncidentId?: string | null
+  location?: { coordinates?: [number, number] }
+  locationUpdatedAt?: string | null
+  createdAt: string
 }
 interface Notification { id: string; msg: string; time: Date; type: 'sos' | 'update' | 'alert' }
 
 const TYPE_EMOJI: Record<string, string> = { food: '🍱', water: '💧', medical: '🏥', rescue: '🚁', shelter: '⛺' }
 const STATUS_COLOR: Record<string, string> = { pending: '#eab308', assigned: '#3b82f6', in_progress: '#f97316', resolved: '#22c55e', cancelled: '#6b7280' }
 const CHART_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#a855f7']
-
-const timeAgo = (d: string) => {
-  const diff = Math.floor((Date.now() - new Date(d).getTime()) / 60000)
-  return diff < 1 ? 'Just now' : diff < 60 ? `${diff}m ago` : `${Math.floor(diff / 60)}h ago`
+const VOLUNTEER_STATUS_COLOR: Record<string, string> = {
+  available: '#22c55e',
+  assigned: '#f97316',
+  offline: '#64748b',
 }
+
+
 
 // ─── Assign Modal ───────────────────────────────────────────────
 const AssignModal = ({ request, volunteers, onClose, onAssigned }: {
-  request: SOSRequest; volunteers: Volunteer[]; onClose: () => void; onAssigned: () => void
+  request: Incident; volunteers: Volunteer[]; onClose: () => void; onAssigned: () => void
 }) => {
   const [selectedVol, setSelectedVol] = useState('')
   const [notes, setNotes] = useState('')
@@ -213,16 +226,45 @@ export default function AdminDashboard() {
   const { user, logout } = useAuth()
   const { socket, connected } = useSocket(user)
   const navigate = useNavigate()
-  const [requests, setRequests] = useState<SOSRequest[]>([])
+  const [requests, setRequests] = useState<Incident[]>([])
   const [volunteers, setVolunteers] = useState<Volunteer[]>([])
   const [stats, setStats] = useState<any>({})
   const [activeTab, setActiveTab] = useState<'overview' | 'requests' | 'volunteers'>('overview')
-  const [assignTarget, setAssignTarget] = useState<SOSRequest | null>(null)
+  const [assignTarget, setAssignTarget] = useState<Incident | null>(null)
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [showNotifs, setShowNotifs] = useState(false)
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterType, setFilterType] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
+
+  const normalizeIncident = useCallback((raw: any): Incident | null => {
+    if (!raw) return null
+    const incidentId = raw._id || raw.requestId
+    if (!incidentId) return null
+
+    return {
+      _id: String(incidentId),
+      entityType: 'incident',
+      type: String(raw.type || 'rescue'),
+      urgency: String(raw.urgency || 'medium'),
+      status: String(raw.status || 'pending'),
+      description: String(raw.description || ''),
+      location: raw.location || { coordinates: [0, 0], address: '' },
+      submittedBy: raw.submittedBy,
+      createdAt: raw.createdAt || new Date().toISOString(),
+      numberOfPeople: typeof raw.numberOfPeople === 'number' ? raw.numberOfPeople : undefined,
+      priorityScore: typeof raw.priorityScore === 'number' ? raw.priorityScore : undefined,
+    }
+  }, [])
+
+  const upsertIncident = useCallback((prev: Incident[], next: Incident) => {
+    const existingIdx = prev.findIndex(item => item._id === next._id)
+    if (existingIdx === -1) return [next, ...prev]
+
+    const merged = [...prev]
+    merged[existingIdx] = { ...merged[existingIdx], ...next }
+    return merged
+  }, [])
 
   const fetchAll = useCallback(async () => {
     try {
@@ -231,21 +273,27 @@ export default function AdminDashboard() {
         axios.get('/api/requests/stats'),
         axios.get('/api/users/volunteers'),
       ])
-      setRequests(reqRes.data.data || [])
+      const incidents = (reqRes.data.data || [])
+        .map((item: any) => normalizeIncident(item))
+        .filter(Boolean) as Incident[]
+      setRequests(incidents)
       setStats(statsRes.data.data || {})
       setVolunteers(volRes.data.data || [])
     } catch { toast.error('Failed to load data') }
-  }, [])
+  }, [normalizeIncident])
 
   useEffect(() => { fetchAll() }, [fetchAll])
 
   useEffect(() => {
     if (!socket) return
     socket.on('new_request', (req: any) => {
-      setRequests(p => [req, ...p])
-      const notif: Notification = { id: Date.now().toString(), msg: `🆘 New ${req.type} SOS — ${req.urgency} urgency`, time: new Date(), type: 'sos' }
+      const incident = normalizeIncident(req)
+      if (!incident) return
+
+      setRequests(p => upsertIncident(p, incident))
+      const notif: Notification = { id: Date.now().toString(), msg: `New incident: ${incident.type} (${incident.urgency})`, time: new Date(), type: 'sos' }
       setNotifications(p => [notif, ...p.slice(0, 19)])
-      toast(`🆘 New ${req.type} SOS!`, { icon: '🚨', duration: 5000 })
+      toast(`New incident: ${incident.type}`, { icon: '🚨', duration: 5000 })
     })
     socket.on('status_updated', ({ requestId, status }: any) => {
       setRequests(p => p.map(r => r._id === requestId ? { ...r, status } : r))
@@ -257,9 +305,54 @@ export default function AdminDashboard() {
       setNotifications(p => [notif, ...p.slice(0, 19)])
       toast.error(`⚠️ Low stock: ${name}`, { duration: 6000 })
     })
-    socket.on('volunteer_status_update', () => fetchAll())
-    return () => { socket.off('new_request'); socket.off('status_updated'); socket.off('resource_low'); socket.off('volunteer_status_update') }
-  }, [socket, fetchAll])
+    socket.on('volunteer_status_update', (payload: any) => {
+      if (!payload?.volunteerId) return
+
+      setVolunteers(prev =>
+        prev.map(vol =>
+          vol._id === payload.volunteerId
+            ? {
+                ...vol,
+                isAvailable: Boolean(payload.available),
+                trackingStatus: payload.trackingStatus || (payload.available ? 'available' : 'offline'),
+                assignedIncidentId: payload.incidentId || null,
+                locationUpdatedAt: payload.locationUpdatedAt || vol.locationUpdatedAt || null,
+                location: payload.location
+                  ? { coordinates: [payload.location.lng, payload.location.lat] }
+                  : vol.location,
+              }
+            : vol
+        )
+      )
+    })
+
+    socket.on('volunteer_location_updated', (payload: any) => {
+      if (!payload?.volunteerId || !payload?.location) return
+
+      setVolunteers(prev =>
+        prev.map(vol =>
+          vol._id === payload.volunteerId
+            ? {
+                ...vol,
+                trackingStatus: payload.status || vol.trackingStatus,
+                isAvailable: payload.status ? payload.status === 'available' : vol.isAvailable,
+                assignedIncidentId: payload.incidentId || null,
+                locationUpdatedAt: payload.timestamp || vol.locationUpdatedAt || null,
+                location: { coordinates: [payload.location.lng, payload.location.lat] },
+              }
+            : vol
+        )
+      )
+    })
+
+    return () => {
+      socket.off('new_request')
+      socket.off('status_updated')
+      socket.off('resource_low')
+      socket.off('volunteer_status_update')
+      socket.off('volunteer_location_updated')
+    }
+  }, [socket, fetchAll, normalizeIncident, upsertIncident])
 
   // Filtered requests (with search)
   const filteredRequests = requests.filter(r => {
@@ -279,7 +372,7 @@ export default function AdminDashboard() {
   const unreadNotifs = notifications.length
 
   const statCards = [
-    { label: 'Today\'s SOS', value: stats.totalToday ?? 0, icon: Zap, color: '#3b82f6', bg: 'rgba(59,130,246,0.1)' },
+    { label: 'Today\'s Incidents', value: stats.totalToday ?? 0, icon: Zap, color: '#3b82f6', bg: 'rgba(59,130,246,0.1)' },
     { label: 'Pending', value: totalCount('pending'), icon: Clock, color: '#eab308', bg: 'rgba(234,179,8,0.1)' },
     { label: 'In Progress', value: totalCount('in_progress'), icon: AlertTriangle, color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
     { label: 'Resolved', value: totalCount('resolved'), icon: CheckCircle, color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
@@ -289,7 +382,7 @@ export default function AdminDashboard() {
 
   const navItems = [
     { key: 'overview', label: 'Overview', icon: BarChart2 },
-    { key: 'requests', label: 'SOS Requests', icon: AlertTriangle },
+    { key: 'requests', label: 'Incidents', icon: AlertTriangle },
     { key: 'volunteers', label: 'Volunteers', icon: Users },
   ]
 
@@ -384,7 +477,7 @@ export default function AdminDashboard() {
                     ) : notifications.map(n => (
                       <div key={n.id} style={{ padding: '10px 16px', borderBottom: '1px solid rgba(255,255,255,0.04)', background: n.type === 'sos' ? 'rgba(239,68,68,0.05)' : n.type === 'alert' ? 'rgba(234,179,8,0.05)' : 'transparent' }}>
                         <div style={{ fontSize: 13, marginBottom: 2 }}>{n.msg}</div>
-                        <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{timeAgo(n.time.toISOString())}</div>
+                        <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }} title={formatExactDate(n.time.toISOString())}>{timeAgo(n.time.toISOString())}</div>
                       </div>
                     ))}
                   </div>
@@ -453,10 +546,10 @@ export default function AdminDashboard() {
                 </div>
               </div>
 
-              {/* Recent pending SOS */}
+              {/* Recent pending incidents */}
               <div className="glass" style={{ overflow: 'hidden' }}>
                 <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <h3 style={{ fontSize: 15, fontWeight: 700 }}>🆘 Pending — Awaiting Assignment</h3>
+                  <h3 style={{ fontSize: 15, fontWeight: 700 }}>Pending Incidents — Awaiting Assignment</h3>
                   <button onClick={() => setActiveTab('requests')} style={{ fontSize: 12, color: 'var(--color-primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}>View All →</button>
                 </div>
                 <table className="data-table">
@@ -468,7 +561,7 @@ export default function AdminDashboard() {
                         <td><span className={`badge badge-${req.urgency}`}>{req.urgency}</span></td>
                         <td style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>{req.submittedBy?.name || '—'}</td>
                         <td style={{ fontSize: 12, color: 'var(--color-text-muted)', maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{req.location.address || 'Map location'}</td>
-                        <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{timeAgo(req.createdAt)}</td>
+                        <td style={{ fontSize: 12, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }} title={formatExactDate(req.createdAt)}>{timeAgo(req.createdAt)}</td>
                         <td><button onClick={() => setAssignTarget(req)} className="btn-success" style={{ fontSize: 12, padding: '5px 12px', display: 'flex', alignItems: 'center', gap: 4 }}><UserCheck size={13} />Assign</button></td>
                       </tr>
                     ))}
@@ -485,8 +578,8 @@ export default function AdminDashboard() {
             <div className="fade-in">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
                 <div>
-                  <h1 style={{ fontSize: 22, fontWeight: 800 }}>🆘 All SOS Requests</h1>
-                  <p style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>{filteredRequests.length} of {requests.length} requests</p>
+                  <h1 style={{ fontSize: 22, fontWeight: 800 }}>All Incidents</h1>
+                  <p style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>{filteredRequests.length} of {requests.length} incidents</p>
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                   {/* Search */}
@@ -523,7 +616,7 @@ export default function AdminDashboard() {
                       Description: r.description, Location: r.location.address,
                       People: r.numberOfPeople, SubmittedBy: r.submittedBy?.name, Phone: r.submittedBy?.phone,
                       Time: new Date(r.createdAt).toLocaleString()
-                    })), 'sos_requests')}
+                    })), 'incidents')}
                     className="btn-secondary"
                     style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 5, background: 'rgba(34,197,94,0.1)', borderColor: 'rgba(34,197,94,0.3)', color: '#4ade80' }}
                     data-tooltip="Export filtered data as CSV"
@@ -547,7 +640,7 @@ export default function AdminDashboard() {
                         <td style={{ fontSize: 12, color: 'var(--color-text-muted)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{req.location.address || `${req.location.coordinates[1]?.toFixed(3)}, ${req.location.coordinates[0]?.toFixed(3)}`}</td>
                         <td style={{ textAlign: 'center' }}>{req.numberOfPeople ?? 1}</td>
                         <td><span className={`badge badge-${req.status}`}>{req.status.replace('_', ' ')}</span></td>
-                        <td style={{ fontSize: 12, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>{timeAgo(req.createdAt)}</td>
+                        <td style={{ fontSize: 12, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }} title={formatExactDate(req.createdAt)}>{timeAgo(req.createdAt)}</td>
                         <td>
                           {req.status === 'pending' && (
                             <button onClick={() => setAssignTarget(req)} className="btn-success" style={{ fontSize: 12, padding: '5px 12px', display: 'flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' }}>
@@ -587,11 +680,49 @@ export default function AdminDashboard() {
                         </div>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: vol.isAvailable ? '#22c55e' : '#6b7280', display: 'inline-block', boxShadow: vol.isAvailable ? '0 0 6px #22c55e' : 'none' }}></span>
-                        <span style={{ fontSize: 12, color: vol.isAvailable ? '#4ade80' : '#9ca3af', fontWeight: 600 }}>{vol.isAvailable ? 'Available' : 'Busy'}</span>
+                        <span
+                          style={{
+                            width: 8,
+                            height: 8,
+                            borderRadius: '50%',
+                            background: VOLUNTEER_STATUS_COLOR[vol.trackingStatus || 'offline'],
+                            display: 'inline-block',
+                            boxShadow:
+                              vol.trackingStatus === 'available'
+                                ? '0 0 6px #22c55e'
+                                : vol.trackingStatus === 'assigned'
+                                  ? '0 0 6px #f97316'
+                                  : 'none',
+                          }}
+                        ></span>
+                        <span
+                          style={{
+                            fontSize: 12,
+                            color:
+                              vol.trackingStatus === 'available'
+                                ? '#4ade80'
+                                : vol.trackingStatus === 'assigned'
+                                  ? '#fdba74'
+                                  : '#9ca3af',
+                            fontWeight: 600,
+                            textTransform: 'capitalize',
+                          }}
+                        >
+                          {vol.trackingStatus || (vol.isAvailable ? 'available' : 'offline')}
+                        </span>
                       </div>
                     </div>
-                    <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12 }}>Joined {timeAgo(vol.createdAt)}</div>
+                    <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12 }} title={formatExactDate(vol.createdAt)}>Joined {timeAgo(vol.createdAt)}</div>
+                    {vol.location?.coordinates && (
+                      <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 10 }}>
+                        Last known: {vol.location.coordinates[1].toFixed(4)}, {vol.location.coordinates[0].toFixed(4)}
+                      </div>
+                    )}
+                    {vol.assignedIncidentId && (
+                      <div style={{ fontSize: 11, color: '#fbbf24', marginBottom: 10 }}>
+                        Assigned incident: {String(vol.assignedIncidentId).slice(-8)}
+                      </div>
+                    )}
                     {vol.isAvailable && (
                       <button
                         onClick={() => {

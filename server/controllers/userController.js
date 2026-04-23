@@ -3,7 +3,7 @@ const User = require('../models/User');
 const getVolunteers = async (req, res) => {
   try {
     const volunteers = await User.find({ role: 'volunteer' })
-      .select('name email phone isAvailable location createdAt')
+      .select('name email phone isAvailable trackingStatus assignedIncidentId location locationUpdatedAt createdAt')
       .sort({ isAvailable: -1, createdAt: -1 });
 
     return res.json({ success: true, count: volunteers.length, data: volunteers });

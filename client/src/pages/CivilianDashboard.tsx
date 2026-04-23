@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect } from 'react'
+import React, { useMemo, useState, useEffect } from 'react'
 import { useAuth } from '../context/AuthContext'
 import { useSocket } from '../hooks/useSocket'
 import { Link, useNavigate } from 'react-router-dom'
@@ -7,6 +7,8 @@ import toast from 'react-hot-toast'
 import { AlertTriangle, MapPin, Clock, CheckCircle, LogOut, Radio, FileText } from 'lucide-react'
 import { useLiveLocationTracking } from '../hooks/useLiveLocationTracking'
 import { ThemeToggle } from '../components/ThemeToggle'
+import { useSmoothedLocation } from '../hooks/useSmoothedLocation'
+import { IncidentTrackingMap } from '../components/IncidentTrackingMap'
 
 interface SOSRequest {
   _id: string
@@ -22,17 +24,10 @@ interface SOSRequest {
 }
 
 const TYPE_ICON: Record<string, string> = {
-  food: 'FOOD',
-  water: 'WATER',
-  medical: 'MED',
-  rescue: 'RESCUE',
-  shelter: 'SHELTER',
+  food: 'FOOD', water: 'WATER', medical: 'MED', rescue: 'RESCUE', shelter: 'SHELTER',
 }
 const URGENCY_COLOR: Record<string, string> = {
-  critical: '#ef4444',
-  high: '#f97316',
-  medium: '#eab308',
-  low: '#22c55e',
+  critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e',
 }
 
 const timeAgo = (d: string) => {
@@ -42,10 +37,7 @@ const timeAgo = (d: string) => {
 
 const STATUS_STEPS = ['pending', 'assigned', 'in_progress', 'resolved']
 const STATUS_LABEL: Record<string, string> = {
-  pending: 'Waiting',
-  assigned: 'Assigned',
-  in_progress: 'En Route',
-  resolved: 'Resolved',
+  pending: 'Waiting', assigned: 'Assigned', in_progress: 'En Route', resolved: 'Resolved',
 }
 
 const ProgressTracker = ({ status }: { status: string }) => {
@@ -60,16 +52,11 @@ const ProgressTracker = ({ status }: { status: string }) => {
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
               <div
                 style={{
-                  width: 28,
-                  height: 28,
-                  borderRadius: '50%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
+                  width: 28, height: 28, borderRadius: '50%',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
                   background: done ? (active ? '#22c55e' : '#22c55e88') : 'rgba(255,255,255,0.08)',
                   border: `2px solid ${done ? '#22c55e' : 'rgba(255,255,255,0.15)'}`,
-                  fontSize: 12,
-                  fontWeight: 700,
+                  fontSize: 12, fontWeight: 700,
                   color: done ? 'white' : 'var(--color-text-muted)',
                   boxShadow: active ? '0 0 10px rgba(34,197,94,0.5)' : 'none',
                 }}
@@ -97,9 +84,35 @@ export default function CivilianDashboard() {
 
   const [myRequests, setMyRequests] = useState<SOSRequest[]>([])
   const [loading, setLoading] = useState(true)
+  const [showHistory, setShowHistory] = useState(false)
   const [trackedVolunteerLocation, setTrackedVolunteerLocation] = useState<{ lat: number; lng: number; incidentId: string } | null>(null)
+  const [trackedVictimLocation, setTrackedVictimLocation] = useState<{ lat: number; lng: number } | null>(null)
+
+  /**
+   * Journey snapshot — set ONCE when a volunteer is assigned.
+   * Drawn as a dashed straight-line on the mini-map.
+   * No ORS / routing API is called.
+   */
+  const [journeyPolyline, setJourneyPolyline] = useState<Array<{ lat: number; lng: number }>>([])
+  const journeySnappedRef = React.useRef<Record<string, boolean>>({})
+
+  const smoothVolunteerLocation = useSmoothedLocation(
+    trackedVolunteerLocation ? { lat: trackedVolunteerLocation.lat, lng: trackedVolunteerLocation.lng } : null,
+    2400
+  )
+  const smoothVictimLocation = useSmoothedLocation(trackedVictimLocation, 2000)
 
   const activeIncidentId = myRequests.find(r => ['assigned', 'in_progress', 'pending'].includes(r.status))?._id || null
+
+  const guidanceIncident = useMemo(
+    () => myRequests.find(r => r.status === 'assigned' || r.status === 'in_progress') || null,
+    [myRequests]
+  )
+
+  const volunteerLocation = useMemo(() => smoothVolunteerLocation || null, [smoothVolunteerLocation])
+  const victimLocation = useMemo(() => smoothVictimLocation || null, [smoothVictimLocation])
+
+  const showGuidance = Boolean(guidanceIncident && trackedVolunteerLocation)
 
   const fetchMyRequests = async () => {
     try {
@@ -112,9 +125,7 @@ export default function CivilianDashboard() {
     }
   }
 
-  useEffect(() => {
-    fetchMyRequests()
-  }, [])
+  useEffect(() => { fetchMyRequests() }, [])
 
   useEffect(() => {
     if (!socket) return
@@ -134,8 +145,10 @@ export default function CivilianDashboard() {
       fetchMyRequests()
     })
 
+    // Receive volunteer location updates — move marker only, no route recalc
     socket.on('volunteer_location_updated', (payload: any) => {
       if (!payload?.incidentId || !payload?.location) return
+      if (activeIncidentId && payload.incidentId !== activeIncidentId) return
       setTrackedVolunteerLocation({
         incidentId: payload.incidentId,
         lat: payload.location.lat,
@@ -155,23 +168,49 @@ export default function CivilianDashboard() {
       socket.off('volunteer_location_updated')
       socket.off('incident_assignment_signal')
     }
-  }, [socket])
+  }, [socket, activeIncidentId])
 
   useEffect(() => {
     if (!socket || !activeIncidentId) return
     socket.emit('join_incident_room', { incidentId: activeIncidentId })
   }, [socket, activeIncidentId])
 
+  // Send victim location via Socket.io
   useLiveLocationTracking({
     socket,
     enabled: Boolean(socket && user && activeIncidentId),
     role: 'user',
     incidentId: activeIncidentId,
     intervalMs: 4000,
+    onLocationUpdate: setTrackedVictimLocation,
   })
 
-  const active = myRequests.filter(r => r.status !== 'resolved' && r.status !== 'cancelled')
-  const resolved = myRequests.filter(r => r.status === 'resolved')
+  // Prime victim location from stored incident coords
+  useEffect(() => {
+    if (!trackedVictimLocation && guidanceIncident?.location?.coordinates?.length === 2) {
+      const [lng, lat] = guidanceIncident.location.coordinates
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        setTrackedVictimLocation({ lat, lng })
+      }
+    }
+  }, [trackedVictimLocation, guidanceIncident])
+
+  // Snapshot the polyline ONCE when a volunteer location arrives for a given incident
+  useEffect(() => {
+    if (!guidanceIncident || !volunteerLocation || !victimLocation) return
+    const id = guidanceIncident._id
+    if (journeySnappedRef.current[id]) return
+    journeySnappedRef.current[id] = true
+    setJourneyPolyline([
+      { lat: volunteerLocation.lat, lng: volunteerLocation.lng },
+      { lat: victimLocation.lat, lng: victimLocation.lng },
+    ])
+  }, [guidanceIncident, volunteerLocation, victimLocation])
+
+  // Partition requests
+  const activeRequests = myRequests.filter(r => r.status !== 'resolved' && r.status !== 'cancelled')
+  const resolvedRequests = myRequests.filter(r => r.status === 'resolved' || r.status === 'cancelled')
+  const displayedRequests = showHistory ? myRequests : activeRequests
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--color-bg)', display: 'flex', flexDirection: 'column' }}>
@@ -188,10 +227,12 @@ export default function CivilianDashboard() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <ThemeToggle compact />
           <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-            <span className="conn-dot" style={{ background: connected ? '#22c55e' : '#ef4444', boxShadow: connected ? '0 0 6px #22c55e' : 'none' }}></span>
+            <span className="conn-dot" style={{ background: connected ? '#22c55e' : '#ef4444', boxShadow: connected ? '0 0 6px #22c55e' : 'none' }} />
             <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{connected ? 'Live' : 'Offline'}</span>
           </div>
-          <span style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>Hi, <strong style={{ color: 'var(--color-text)' }}>{user?.name.split(' ')[0]}</strong></span>
+          <span style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>
+            Hi, <strong style={{ color: 'var(--color-text)' }}>{user?.name.split(' ')[0]}</strong>
+          </span>
           <Link to="/" className="btn-secondary" style={{ textDecoration: 'none', fontSize: 13, padding: '7px 12px', display: 'flex', alignItems: 'center', gap: 5 }}>
             <MapPin size={13} />Live Map
           </Link>
@@ -202,12 +243,36 @@ export default function CivilianDashboard() {
       </header>
 
       <main style={{ flex: 1, maxWidth: 900, width: '100%', margin: '0 auto', padding: '32px 24px' }}>
-        {trackedVolunteerLocation && (
-          <div className="glass" style={{ padding: 12, marginBottom: 14, border: '1px solid rgba(34,197,94,0.35)' }}>
-            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>Volunteer Live Location</div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-              Incident: {trackedVolunteerLocation.incidentId} | Lat: {trackedVolunteerLocation.lat.toFixed(5)} | Lng: {trackedVolunteerLocation.lng.toFixed(5)}
+
+        {/* ── Volunteer tracking panel ── */}
+        {showGuidance && (
+          <div className="glass" style={{ padding: 14, marginBottom: 20, border: '1px solid rgba(34,197,94,0.35)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>🚗 Volunteer is on the way</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '3px 10px', borderRadius: 20, background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.3)' }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 6px #22c55e', display: 'block' }} />
+                <span style={{ fontSize: 12, color: '#4ade80', fontWeight: 700 }}>Live Tracking</span>
+              </div>
             </div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
+              Help is coming! The dashed line shows approximate direction — volunteer is navigating via Google Maps.
+            </div>
+            <IncidentTrackingMap
+              center={volunteerLocation || victimLocation}
+              primaryMarker={
+                victimLocation
+                  ? { lat: victimLocation.lat, lng: victimLocation.lng, label: '📍 You', color: '#3b82f6' }
+                  : null
+              }
+              secondaryMarker={
+                volunteerLocation
+                  ? { lat: volunteerLocation.lat, lng: volunteerLocation.lng, label: '🚗 Volunteer', color: '#22c55e' }
+                  : null
+              }
+              guidePath={journeyPolyline.length >= 2 ? journeyPolyline : undefined}
+              highlightPrimary
+              height={240}
+            />
           </div>
         )}
 
@@ -215,19 +280,22 @@ export default function CivilianDashboard() {
           <div>
             <h1 style={{ fontSize: 26, fontWeight: 900, letterSpacing: '-0.5px', marginBottom: 6 }}>My Relief Requests</h1>
             <p style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>
-              {active.length === 0 ? 'You have no active requests. Stay safe.' : `${active.length} active request${active.length > 1 ? 's' : ''} being coordinated.`}
+              {activeRequests.length === 0
+                ? 'No active requests. Stay safe.'
+                : `${activeRequests.length} active request${activeRequests.length > 1 ? 's' : ''} being coordinated.`}
             </p>
           </div>
-          <Link to="/sos" className="btn-primary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 8, padding: '12px 24px', fontSize: 15, fontWeight: 800, letterSpacing: 0.5 }}>
+          <Link to="/sos" className="btn-primary" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 8, padding: '12px 24px', fontSize: 15, fontWeight: 800 }}>
             <AlertTriangle size={18} />Send SOS
           </Link>
         </div>
 
+        {/* Stat cards */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 32 }}>
           {[
             { label: 'Total Sent', value: myRequests.length, icon: FileText, color: '#3b82f6' },
-            { label: 'Active', value: active.length, icon: Radio, color: '#f97316' },
-            { label: 'Resolved', value: resolved.length, icon: CheckCircle, color: '#22c55e' },
+            { label: 'Active', value: activeRequests.length, icon: Radio, color: '#f97316' },
+            { label: 'Resolved', value: resolvedRequests.length, icon: CheckCircle, color: '#22c55e' },
           ].map(s => {
             const Icon = s.icon
             return (
@@ -242,23 +310,43 @@ export default function CivilianDashboard() {
           })}
         </div>
 
+        {/* History toggle */}
+        {resolvedRequests.length > 0 && (
+          <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button
+              onClick={() => setShowHistory(h => !h)}
+              style={{ padding: '6px 14px', borderRadius: 8, border: '1px solid var(--glass-border)', background: showHistory ? 'rgba(34,197,94,0.12)' : 'var(--glass-bg)', color: showHistory ? '#4ade80' : 'var(--color-text-muted)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}
+            >
+              {showHistory ? '✅ Showing all (incl. resolved)' : '📋 Show resolved history'}
+            </button>
+          </div>
+        )}
+
         {loading ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {[1, 2].map(i => (
-              <div key={i} className="glass" style={{ padding: 24, height: 160 }} />
-            ))}
+            {[1, 2].map(i => <div key={i} className="glass" style={{ padding: 24, height: 160 }} />)}
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {myRequests.length === 0 && (
+            {displayedRequests.length === 0 && (
               <div className="glass fade-in" style={{ padding: 48, textAlign: 'center' }}>
-                <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>No requests yet</h3>
-                <p style={{ color: 'var(--color-text-muted)', marginBottom: 24, fontSize: 14 }}>If you need emergency assistance, press the SOS button.</p>
+                <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>No active requests</h3>
+                <p style={{ color: 'var(--color-text-muted)', marginBottom: 24, fontSize: 14 }}>
+                  If you need emergency assistance, press the SOS button above.
+                </p>
               </div>
             )}
 
-            {myRequests.map(req => (
-              <div key={req._id} className="glass fade-in" style={{ padding: 22, borderLeft: `4px solid ${URGENCY_COLOR[req.urgency] || '#6b7280'}` }}>
+            {displayedRequests.map(req => (
+              <div
+                key={req._id}
+                className="glass fade-in"
+                style={{
+                  padding: 22,
+                  borderLeft: `4px solid ${URGENCY_COLOR[req.urgency] || '#6b7280'}`,
+                  opacity: req.status === 'resolved' || req.status === 'cancelled' ? 0.65 : 1,
+                }}
+              >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 }}>
                   <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                     <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)' }}>{TYPE_ICON[req.type] || 'INCIDENT'}</span>
@@ -282,13 +370,11 @@ export default function CivilianDashboard() {
                 )}
 
                 {req.assignedTask?.volunteerId && (
-                  <div style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <div>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: '#4ade80' }}>Volunteer Assigned</div>
-                      <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                        {req.assignedTask.volunteerId.name}
-                        {req.assignedTask.volunteerId.phone && ` | ${req.assignedTask.volunteerId.phone}`}
-                      </div>
+                  <div style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: '#4ade80' }}>Volunteer Assigned 🚗</div>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                      {req.assignedTask.volunteerId.name}
+                      {req.assignedTask.volunteerId.phone && ` | ${req.assignedTask.volunteerId.phone}`}
                     </div>
                   </div>
                 )}

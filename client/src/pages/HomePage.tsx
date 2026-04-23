@@ -4,12 +4,14 @@ import * as THREE from 'three'
 import {
   CircleMarker,
   MapContainer,
+  Marker,
   Popup,
   TileLayer,
   Tooltip,
   ZoomControl,
   useMap,
 } from 'react-leaflet'
+import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
@@ -29,8 +31,9 @@ import {
   X,
 } from 'lucide-react'
 
-interface RequestData {
+interface IncidentData {
   _id: string
+  entityType?: 'incident'
   type: string
   urgency: 'critical' | 'high' | 'medium' | 'low' | string
   description: string
@@ -46,6 +49,9 @@ interface ActorData {
   name: string
   role: 'admin' | 'volunteer' | 'user' | string
   isAvailable?: boolean
+  trackingStatus?: 'offline' | 'available' | 'assigned' | string
+  assignedIncidentId?: string | null
+  locationUpdatedAt?: string | null
   location?: { coordinates?: [number, number] }
 }
 
@@ -54,7 +60,7 @@ interface GlobePoint {
   lng: number
   size: number
   color: string
-  request: RequestData
+  request: IncidentData
 }
 
 const URGENCY_COLORS: Record<string, string> = {
@@ -97,6 +103,7 @@ const getLatLng = (coords?: [number, number]) => {
   if (!coords || coords.length !== 2) return null
   const [lng, lat] = coords
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null
+  if (lat === 0 && lng === 0) return null
   return [lat, lng] as [number, number]
 }
 
@@ -120,7 +127,7 @@ export default function HomePage() {
   const globeRef = useRef<any>(null)
   const globeViewportRef = useRef<HTMLDivElement | null>(null)
 
-  const [requests, setRequests] = useState<RequestData[]>([])
+  const [requests, setRequests] = useState<IncidentData[]>([])
   const [actors, setActors] = useState<ActorData[]>([])
   const [filterUrgency, setFilterUrgency] = useState('all')
   const [filterType, setFilterType] = useState('all')
@@ -128,7 +135,35 @@ export default function HomePage() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [viewMode, setViewMode] = useState<'globe' | 'map'>('globe')
   const [globeSize, setGlobeSize] = useState({ width: 1200, height: 700 })
-  const [selectedRequest, setSelectedRequest] = useState<RequestData | null>(null)
+  const [selectedRequest, setSelectedRequest] = useState<IncidentData | null>(null)
+
+  const normalizeIncident = useCallback((raw: any): IncidentData | null => {
+    if (!raw) return null
+    const incidentId = raw._id || raw.requestId
+    if (!incidentId) return null
+
+    return {
+      _id: String(incidentId),
+      entityType: 'incident',
+      type: String(raw.type || 'rescue'),
+      urgency: String(raw.urgency || 'medium'),
+      description: String(raw.description || ''),
+      status: String(raw.status || 'pending'),
+      location: raw.location || { coordinates: [0, 0], address: '' },
+      submittedBy: raw.submittedBy,
+      createdAt: raw.createdAt || new Date().toISOString(),
+      numberOfPeople: typeof raw.numberOfPeople === 'number' ? raw.numberOfPeople : undefined,
+    }
+  }, [])
+
+  const upsertIncident = useCallback((prev: IncidentData[], next: IncidentData) => {
+    const existingIdx = prev.findIndex(item => item._id === next._id)
+    if (existingIdx === -1) return [next, ...prev]
+
+    const merged = [...prev]
+    merged[existingIdx] = { ...merged[existingIdx], ...next }
+    return merged
+  }, [])
 
   useEffect(() => {
     if (!globeViewportRef.current) return
@@ -178,11 +213,14 @@ export default function HomePage() {
   const fetchRequests = useCallback(async () => {
     try {
       const { data } = await axios.get('/api/requests?limit=300')
-      setRequests(data.data || [])
+      const incidents = (data.data || [])
+        .map((item: any) => normalizeIncident(item))
+        .filter(Boolean) as IncidentData[]
+      setRequests(incidents)
     } catch {
       // guest view
     }
-  }, [])
+  }, [normalizeIncident])
 
   const fetchActors = useCallback(async () => {
     if (!user || user.role !== 'admin') {
@@ -208,9 +246,12 @@ export default function HomePage() {
   useEffect(() => {
     if (!socket) return
 
-    const handleNewRequest = (req: RequestData) => {
-      setRequests(prev => [req, ...prev])
-      toast(`New ${req.type} SOS - ${req.urgency}`, { duration: 4500 })
+    const handleNewRequest = (req: any) => {
+      const incident = normalizeIncident(req)
+      if (!incident) return
+
+      setRequests(prev => upsertIncident(prev, incident))
+      toast(`New incident: ${incident.type} (${incident.urgency})`, { duration: 4500 })
     }
 
     const handleStatusUpdate = ({ requestId, status }: { requestId: string; status: string }) => {
@@ -218,8 +259,39 @@ export default function HomePage() {
       setSelectedRequest(prev => (prev && prev._id === requestId ? { ...prev, status } : prev))
     }
 
-    const handleVolunteerUpdate = () => {
-      fetchActors()
+    const handleVolunteerUpdate = (payload?: {
+      volunteerId?: string
+      available?: boolean
+      trackingStatus?: string
+      incidentId?: string | null
+      location?: { lat: number; lng: number } | null
+      locationUpdatedAt?: string | null
+    }) => {
+      if (!payload?.volunteerId) {
+        fetchActors()
+        return
+      }
+
+      setActors(prev =>
+        prev.map(actor => {
+          if (actor._id !== payload.volunteerId) return actor
+
+          return {
+            ...actor,
+            isAvailable: typeof payload.available === 'boolean' ? payload.available : actor.isAvailable,
+            trackingStatus: payload.trackingStatus || actor.trackingStatus,
+            assignedIncidentId: payload.incidentId || null,
+            locationUpdatedAt: payload.locationUpdatedAt || actor.locationUpdatedAt || null,
+            location:
+              payload.location && Number.isFinite(payload.location.lat) && Number.isFinite(payload.location.lng)
+                ? {
+                    ...(actor.location || {}),
+                    coordinates: [payload.location.lng, payload.location.lat] as [number, number],
+                  }
+                : actor.location,
+          }
+        })
+      )
     }
 
     const handleVolunteerLocationUpdated = (payload: {
@@ -227,6 +299,7 @@ export default function HomePage() {
       location?: { lat: number; lng: number }
       status?: string
       incidentId?: string | null
+      timestamp?: string
     }) => {
       if (!payload?.volunteerId || !payload.location) return
       const location = payload.location
@@ -235,28 +308,10 @@ export default function HomePage() {
           actor._id === payload.volunteerId
             ? {
                 ...actor,
-                isAvailable: payload.status === 'available',
-                location: {
-                  ...(actor.location || {}),
-                  coordinates: [location.lng, location.lat] as [number, number],
-                },
-              }
-            : actor
-        )
-      )
-    }
-
-    const handleUserLocationUpdated = (payload: {
-      userId: string
-      location?: { lat: number; lng: number }
-    }) => {
-      if (!payload?.userId || !payload.location) return
-      const location = payload.location
-      setActors(prev =>
-        prev.map(actor =>
-          actor._id === payload.userId
-            ? {
-                ...actor,
+                isAvailable: payload.status ? payload.status === 'available' : actor.isAvailable,
+                trackingStatus: payload.status || actor.trackingStatus,
+                assignedIncidentId: payload.incidentId || null,
+                locationUpdatedAt: payload.timestamp || actor.locationUpdatedAt,
                 location: {
                   ...(actor.location || {}),
                   coordinates: [location.lng, location.lat] as [number, number],
@@ -271,7 +326,6 @@ export default function HomePage() {
     socket.on('request_status_updated', handleStatusUpdate)
     socket.on('volunteer_status_update', handleVolunteerUpdate)
     socket.on('volunteer_location_updated', handleVolunteerLocationUpdated)
-    socket.on('user_location_updated', handleUserLocationUpdated)
     socket.on('volunteer_assignment_updated', handleVolunteerUpdate)
     socket.on('incident_assignment_updated', handleVolunteerUpdate)
 
@@ -280,11 +334,10 @@ export default function HomePage() {
       socket.off('request_status_updated', handleStatusUpdate)
       socket.off('volunteer_status_update', handleVolunteerUpdate)
       socket.off('volunteer_location_updated', handleVolunteerLocationUpdated)
-      socket.off('user_location_updated', handleUserLocationUpdated)
       socket.off('volunteer_assignment_updated', handleVolunteerUpdate)
       socket.off('incident_assignment_updated', handleVolunteerUpdate)
     }
-  }, [socket, fetchActors])
+  }, [socket, fetchActors, normalizeIncident, upsertIncident])
 
   const getDashboardLink = () => {
     if (!user) return '/login'
@@ -296,6 +349,8 @@ export default function HomePage() {
   const filteredRequests = useMemo(
     () =>
       requests.filter(r => {
+        // Never show resolved or cancelled incidents on the public map
+        if (r.status === 'resolved' || r.status === 'cancelled') return false
         if (filterUrgency !== 'all' && r.urgency !== filterUrgency) return false
         if (filterType !== 'all' && r.type !== filterType) return false
         return true
@@ -330,13 +385,15 @@ export default function HomePage() {
     [actors]
   )
 
-  const userMarkers = useMemo(
+  const volunteerIcon = useMemo(
     () =>
-      actors
-        .filter(actor => actor.role === 'user')
-        .map(actor => ({ actor, latLng: getLatLng(actor.location?.coordinates) }))
-        .filter(item => item.latLng) as { actor: ActorData; latLng: [number, number] }[],
-    [actors]
+      L.divIcon({
+        className: 'volunteer-marker-icon',
+        html: '<span class="volunteer-marker-glyph">&#128100;</span>',
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+      }),
+    []
   )
 
   const selectedLatLng = selectedRequest ? getLatLng(selectedRequest.location?.coordinates) : null
@@ -480,15 +537,16 @@ export default function HomePage() {
                     const latLng = getLatLng(req.location?.coordinates)
                     if (!latLng) return null
                     const color = URGENCY_COLORS[req.urgency] || '#60a5fa'
+                    const isCritical = req.urgency === 'critical'
                     return (
                       <CircleMarker
                         key={req._id}
                         center={latLng}
-                        radius={req.urgency === 'critical' ? 11 : 8}
-                        pathOptions={{ color, fillColor: color, fillOpacity: 0.75, weight: 2 }}
+                        radius={isCritical ? 11 : 8}
+                        pathOptions={{ color, fillColor: color, fillOpacity: 0.8, weight: isCritical ? 3 : 2, className: isCritical ? 'incident-circle incident-pulse' : 'incident-circle' }}
                         eventHandlers={{ click: () => setSelectedRequest(req) }}
                       >
-                        <Tooltip>{`${TYPE_LABELS[req.type] || req.type} - ${req.urgency}`}</Tooltip>
+                        <Tooltip>{`${TYPE_LABELS[req.type] || req.type} | ${req.urgency.toUpperCase()} | ${req.status.replace('_', ' ')}`}</Tooltip>
                         <Popup>
                           <div>
                             <div style={{ fontWeight: 700, textTransform: 'capitalize' }}>{TYPE_LABELS[req.type] || req.type}</div>
@@ -501,16 +559,15 @@ export default function HomePage() {
                   })}
 
                   {volunteerMarkers.map(({ actor, latLng }) => (
-                    <CircleMarker key={`vol-${actor._id}`} center={latLng} radius={6} pathOptions={{ color: actor.isAvailable ? '#3b82f6' : '#64748b', fillColor: actor.isAvailable ? '#3b82f6' : '#64748b', fillOpacity: 0.85, weight: 2 }}>
-                      <Tooltip>{`Volunteer: ${actor.name}`}</Tooltip>
-                    </CircleMarker>
+                    <Marker
+                      key={`vol-${actor._id}`}
+                      position={latLng}
+                      icon={volunteerIcon}
+                    >
+                      <Tooltip>{`Volunteer: ${actor.name} (${actor.trackingStatus || 'offline'})`}</Tooltip>
+                    </Marker>
                   ))}
 
-                  {userMarkers.map(({ actor, latLng }) => (
-                    <CircleMarker key={`user-${actor._id}`} center={latLng} radius={5} pathOptions={{ color: '#a855f7', fillColor: '#a855f7', fillOpacity: 0.75, weight: 2 }}>
-                      <Tooltip>{`User: ${actor.name}`}</Tooltip>
-                    </CircleMarker>
-                  ))}
                 </MapContainer>
               )}
             </div>
@@ -600,12 +657,10 @@ export default function HomePage() {
                 <>
                   <div style={{ marginTop: 8, fontSize: 11, color: panelMuted, fontWeight: 700, textTransform: 'uppercase' }}>Actors</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 4 }}>
-                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#3b82f6', display: 'block' }}></span>
+                    <span className="volunteer-marker-icon" style={{ width: 18, height: 18, minWidth: 18 }}>
+                      <span className="volunteer-marker-glyph" style={{ fontSize: 11 }}>&#128100;</span>
+                    </span>
                     <span style={{ fontSize: 12, color: panelText }}>Volunteers</span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 4 }}>
-                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#a855f7', display: 'block' }}></span>
-                    <span style={{ fontSize: 12, color: panelText }}>Users</span>
                   </div>
                 </>
               )}
@@ -652,8 +707,8 @@ export default function HomePage() {
           <div style={{ width: 300, background: 'var(--color-surface)', borderLeft: '1px solid var(--glass-border)', display: 'flex', flexDirection: 'column', overflow: 'hidden', flexShrink: 0 }}>
             <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
               <div>
-                <h2 style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>Live Incidents</h2>
-                <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 2 }}>{filteredRequests.length} active</p>
+                <h2 style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>Active Incidents</h2>
+                <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 2 }}>{filteredRequests.length} active (resolved hidden)</p>
               </div>
               <button onClick={() => setSidebarOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer' }}>
                 <X size={16} />
